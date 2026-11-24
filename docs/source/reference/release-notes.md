@@ -18,6 +18,9 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
   existing power flow solution after changing their parameters (inertia,
   gains, time constants, event times, ...). Trajectories match a newly built
   system with the same values, without parsing, setup or power flow.
+- Add `andes.core.ParamVector`, a flat vector view of selected numerical
+  parameters across models with `get()`/`set()` in system or device base,
+  entry names, positions and metadata, for optimizers and sensitivity studies.
 - Fix `Toggle` re-initialization overwriting the stored initial status with
   1, which switched on devices that start offline.
 

@@ -78,6 +78,7 @@ Others
    :template: autosummary/module_toctree.rst
 
    andes.cli
+   andes.core.paramvec
    andes.main
    andes.utils.paths
    andes.utils.snapshot

@@ -11,6 +11,7 @@ from andes.core.discrete import (AntiWindup, DeadBand, DeadBandRT,  # NOQA
 from andes.core.model import Model, ModelCall, ModelData  # NOQA
 from andes.core.param import (BaseParam, DataParam, ExtParam, IdxParam,  # NOQA
                               NumParam, TimerParam,)
+from andes.core.paramvec import ParamVector  # NOQA
 from andes.core.service import (BackRef, BaseService, ConstService,  # NOQA
                                 ExtService, IdxRepeat, NumReduce, NumRepeat,
                                 OperationService, RandomService,)
