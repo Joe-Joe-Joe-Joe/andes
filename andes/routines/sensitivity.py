@@ -13,7 +13,7 @@ import logging
 from collections import OrderedDict
 
 from andes.core.param import NumParam, TimerParam
-from andes.core.paramjac import ParamJacobian, varservice_jacobian
+from andes.core.paramjac import ParamJacobian, input_cache, varservice_jacobian
 from andes.core.service import BaseService, VarService
 from andes.routines.daeint import ImplicitIter, Trapezoid
 from andes.shared import np
@@ -21,18 +21,77 @@ from andes.shared import np
 logger = logging.getLogger(__name__)
 
 
-def _to_scipy(m):
-    """Convert a kvxopt ``spmatrix`` to a SciPy CSC matrix."""
-    from scipy.sparse import csc_matrix
-
-    return csc_matrix((np.array(m.V).ravel(), (np.array(m.I).ravel(), np.array(m.J).ravel())),
-                      shape=m.size)
-
-
 def _copy_sp(m):
     from kvxopt import spmatrix
 
     return spmatrix(m.V, m.I, m.J, m.size)
+
+
+def _triplets(m):
+    """``(rows, cols, vals)`` of a kvxopt ``spmatrix`` as NumPy arrays."""
+    return (np.array(m.I, dtype=int).ravel(), np.array(m.J, dtype=int).ravel(),
+            np.array(m.V).ravel())
+
+
+class _StepMatrix:
+    """
+    The sensitivity step matrix ``[[Tf - h/2 fx, -h/2 fy], [gx, gy]]`` with a
+    fixed sparsity pattern, factorized with KLU.
+
+    The pattern is the union of its blocks and the full diagonal (for rows
+    replaced by identity rows). It is built once and rebuilt only if a
+    block's pattern changes; each step scatters new values into it and
+    reuses the symbolic factorization.
+    """
+
+    def __init__(self, n, m, nrhs):
+        from kvxopt import matrix
+
+        self.n, self.m = n, m
+        self._key = None
+        # right-hand side, solved in place; ``rhs`` is a NumPy view of it
+        self._B = matrix(0.0, (n + m, nrhs))
+        self.rhs = np.asarray(self._B)
+
+    def _build(self, blocks):
+        size = self.n + self.m
+        rows = np.concatenate([r for r, _ in blocks] + [np.arange(size)])
+        cols = np.concatenate([c for _, c in blocks] + [np.arange(size)])
+        uniq, inv = np.unique(cols.astype(np.int64) * size + rows, return_inverse=True)
+        self.rows = (uniq % size).astype(int)
+        self.cols = (uniq // size).astype(int)
+        self.inv = inv
+        self.diag = inv[-size:]
+        self.nnz = uniq.size
+        self.F = None
+
+    def solve(self, blocks, values, pinned):
+        """
+        Assemble from ``blocks`` (list of ``(rows, cols)``) and ``values``,
+        replace ``pinned`` rows by identity rows, and solve in place for the
+        right-hand side written into :attr:`rhs`, which then holds the
+        solution.
+        """
+        from kvxopt import klu, spmatrix
+
+        key = [np.concatenate([r for r, _ in blocks]), np.concatenate([c for _, c in blocks])]
+        if self._key is None or any(a.shape != b.shape or not np.array_equal(a, b)
+                                    for a, b in zip(key, self._key)):
+            self._build(blocks)
+            self._key = key
+
+        data = np.bincount(self.inv[:-self.diag.size], weights=np.concatenate(values),
+                           minlength=self.nnz)
+        if pinned.any():
+            data[pinned[self.rows]] = 0.0
+            data[self.diag[pinned]] = 1.0
+
+        A = spmatrix(data, self.rows, self.cols, (self.n + self.m, self.n + self.m))
+        if self.F is None:
+            self.F = klu.symbolic(A)
+        N = klu.numeric(A, self.F)
+        klu.solve(A, self.F, N, self._B)
+        return self.rhs
 
 
 class _SensTrapezoid(Trapezoid):
@@ -157,6 +216,7 @@ class TrajectorySensitivity:
         self.unsupported = list(self.pj.unsupported) + list(self.vsj.unsupported)
         self.tp = self.pj.tf_p().tocsr()
         self._pinned = self._pinned_limits()
+        self._pin_index = self._pinned_index()
 
         self.t = np.array([])
         self.Sx = np.zeros((0, system.dae.n, len(pv)))
@@ -274,69 +334,112 @@ class TrajectorySensitivity:
     # --- stepping ---------------------------------------------------------
 
     def _jacobians(self):
-        """Exact Jacobians at the current point, leaving ANDES's own untouched."""
+        """
+        Exact Jacobians at the current point as ``(rows, cols, vals)``
+        triplets, including the terms through ``VarService`` values, and the
+        parameter Jacobians. ANDES's own Jacobians are left untouched.
+        """
         ss = self.system
         dae = ss.dae
         saved = [_copy_sp(m) for m in (dae.fx, dae.fy, dae.gx, dae.gy)]
         ss.j_update(models=ss.exist.pflow_tds)
-        jac = [_to_scipy(m) for m in (dae.fx, dae.fy, dae.gx, dae.gy)]
+        jac = dict(zip(('fx', 'fy', 'gx', 'gy'),
+                       (_triplets(m) for m in (dae.fx, dae.fy, dae.gx, dae.gy))))
         dae.fx, dae.fy, dae.gx, dae.gy = saved
 
-        # terms through VarService values, which ANDES's Jacobians leave out
-        extra = self.vsj()
-        jac = [j + extra[k] for j, k in zip(jac, ('fx', 'fy', 'gx', 'gy'))]
-        fp, gp = self.pj.evaluate()
-        return jac, fp.toarray(), gp.toarray()
+        with input_cache():
+            # terms through VarService values, which ANDES's Jacobians leave out
+            extra = self.vsj.triplets()
+            fp, gp = self.pj.evaluate()
+        jac = {k: tuple(np.concatenate([a, b]) for a, b in zip(jac[k], extra[k])) for k in jac}
+        return jac, fp, gp
+
+    def _rhs_operators(self, jac):
+        """``fx`` and ``fy`` as SciPy matrices, for the next step's right-hand side."""
+        from scipy.sparse import coo_matrix
+
+        n, m = self.system.dae.n, self.system.dae.m
+        fx = coo_matrix((jac['fx'][2], (jac['fx'][0], jac['fx'][1])), shape=(n, n)).tocsr()
+        fy = coo_matrix((jac['fy'][2], (jac['fy'][0], jac['fy'][1])), shape=(n, m)).tocsr()
+        return fx, fy
 
     def _start(self):
-        n = self.system.dae.n
+        dae = self.system.dae
+        n = dae.n
         self._Sx = self.S0[:n].copy()
         self._Sy = self.S0[n:].copy()
-        (self._fx0, self._fy0, _, _), self._fp0, _ = self._jacobians()
+        jac, self._fp0, _ = self._jacobians()
+        self._fx0, self._fy0 = self._rhs_operators(jac)
+        self._matrix = _StepMatrix(dae.n, dae.m, len(self.pv))
+        tp = self.tp.tocoo()
+        self._tp = (tp.row, tp.col, tp.data)
         self._t, self._sx, self._sy = [0.0], [self._Sx.copy()], [self._Sy.copy()]
 
-    def _advance(self, tds):
-        from scipy.sparse import bmat, diags
-        from scipy.sparse.linalg import splu
-
-        dae = self.system.dae
-        n, m = dae.n, dae.m
-        h = float(tds.h)
-        (fx, fy, gx, gy), fp1, gp1 = self._jacobians()
-        Tf = dae.Tf
-
-        A = bmat([[diags(Tf) - 0.5 * h * fx, -0.5 * h * fy],
-                  [gx, gy]], format='csr')
-
-        rhs = np.empty((n + m, len(self.pv)))
-        rhs[:n] = (Tf[:, None] * self._Sx
-                   + 0.5 * h * (self._fx0 @ self._Sx + self._fy0 @ self._Sy + self._fp0 + fp1)
-                   - self.tp.multiply((dae.x - tds.x0)[:, None]).toarray())
-        rhs[n:] = -gp1
-
-        # states pinned at a limit follow the limit: replace their rows by
-        # identity rows with the derivative of the limit on the right
-        pinned = np.zeros(n + m, dtype=bool)
+    def _pinned_index(self):
+        """
+        Stack the limiters' devices once: state addresses, the flag arrays to
+        read each step, and the derivative of each device's limit.
+        """
+        addr, flags, rows = [], [], []
         for item, limits in self._pinned:
-            if not item.x_set:
-                continue
-            for side, flag in (('upper', item.zu), ('lower', item.zl)):
+            for side, flag_name in (('upper', 'zu'), ('lower', 'zl')):
                 if side not in limits:
                     continue
-                for i in np.flatnonzero(flag):
-                    row = int(item.state.a[i])
-                    pinned[row] = True
-                    rhs[row] = limits[side][i]
-        if pinned.any():
-            A = diags((~pinned).astype(float)) @ A + diags(pinned.astype(float))
+                addr.append(np.asarray(item.state.a, dtype=int))
+                flags.append((item, flag_name))
+                rows.append(limits[side])
+        if not addr:
+            return None
+        return np.concatenate(addr), flags, np.vstack(rows)
 
-        S = splu(A.tocsc()).solve(rhs)
-        self._Sx, self._Sy = S[:n], S[n:]
-        self._fx0, self._fy0, self._fp0 = fx, fy, fp1
+    def _pinned_rows(self, rhs):
+        """Mark states pinned at a limit and put the limit's derivative into ``rhs``."""
+        pinned = np.zeros(rhs.shape[0], dtype=bool)
+        if self._pin_index is None:
+            return pinned
+        addr, flags, rows = self._pin_index
+        on = np.concatenate([np.asarray(getattr(item, name), dtype=bool) if item.x_set
+                             else np.zeros(item.owner.n, dtype=bool) for item, name in flags])
+        if on.any():
+            pinned[addr[on]] = True
+            rhs[addr[on]] = rows[on]
+        return pinned
+
+    def _advance(self, tds):
+        dae = self.system.dae
+        n = dae.n
+        h = float(tds.h)
+        jac, fp1, gp1 = self._jacobians()
+        Tf = dae.Tf
+
+        (fxr, fxc, fxv), (fyr, fyc, fyv) = jac['fx'], jac['fy']
+        (gxr, gxc, gxv), (gyr, gyc, gyv) = jac['gx'], jac['gy']
+        diag = np.arange(n)
+        blocks = [(diag, diag), (fxr, fxc), (fyr, fyc + n), (gxr + n, gxc), (gyr + n, gyc + n)]
+        values = [Tf, -0.5 * h * fxv, -0.5 * h * fyv, gxv, gyv]
+
+        rhs = self._matrix.rhs
+        rhs[:n] = Tf[:, None] * self._Sx + 0.5 * h * (self._fx0 @ self._Sx + self._fy0 @ self._Sy)
+        rhs[n:] = 0.0
+        fp = (self._fp0 + fp1).tocoo()
+        np.add.at(rhs, (fp.row, fp.col), 0.5 * h * fp.data)
+        gp = gp1.tocoo()
+        np.add.at(rhs, (gp.row + n, gp.col), -gp.data)
+        r, c, v = self._tp
+        np.add.at(rhs, (r, c), -v * (dae.x - tds.x0)[r])
+
+        # states pinned at a limit follow the limit: their rows become
+        # identity rows with the derivative of the limit on the right
+        pinned = self._pinned_rows(rhs)
+
+        S = self._matrix.solve(blocks, values, pinned)
+        self._Sx, self._Sy = S[:n].copy(), S[n:].copy()
+        self._fx0, self._fy0 = self._rhs_operators(jac)
+        self._fp0 = fp1
 
         self._t.append(float(dae.t))
-        self._sx.append(self._Sx.copy())
-        self._sy.append(self._Sy.copy())
+        self._sx.append(self._Sx)
+        self._sy.append(self._Sy)
 
     def run(self, **kwargs):
         """

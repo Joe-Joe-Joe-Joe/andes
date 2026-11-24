@@ -80,13 +80,17 @@ def _substitute(expr, rule):
 class _Term:
     """A lambdified expression and the names of its inputs."""
 
-    def __init__(self, expr, inputs_dict, modules):
+    def __init__(self, expr, inputs_dict, modules, compile=True):
         self.expr = expr
+        self.value = None
         known = set(inputs_dict.values())
         syms = sorted((s for s in expr.free_symbols if s in known), key=lambda s: s.name)
         unknown = [s for s in expr.free_symbols if s not in known]
         if unknown:
             raise ValueError(f'Expression "{expr}" contains unknown symbols {unknown}.')
+        if not compile:
+            self.func = None
+            return
 
         self.args = [s.name for s in syms]
         self.func = sp.lambdify(syms, expr, modules=modules)
@@ -97,6 +101,8 @@ class _Term:
             self.args = self.args + select_args_add
 
     def __call__(self, inputs, n):
+        if self.func is None:
+            return self.value          # filled by a _TermBatch
         out = self.func(*[inputs[name] for name in self.args])
         out = np.broadcast_to(np.asarray(out), (n,))
         if np.iscomplexobj(out):
@@ -152,12 +158,67 @@ def _split_complex(expr):
     return sp.expand_complex(sp.re(expr)), sp.expand_complex(sp.im(expr))
 
 
+class _TermBatch:
+    """
+    All derivative terms of one model in a single lambdified function, so
+    that one evaluation per step fills ``term.value`` of every term.
+    """
+
+    def __init__(self, terms, known, modules):
+        self.terms = list(terms)
+        if not self.terms:
+            self.func, self.args = None, []
+            return
+        syms = sorted({s for t in self.terms for s in t.expr.free_symbols}, key=lambda s: s.name)
+        exprs = sp.Tuple(*[t.expr for t in self.terms])
+        self.args = [s.name for s in syms]
+        self.func = sp.lambdify(syms, exprs, modules=modules)
+        if 'select' in inspect.getsource(self.func):
+            extra = [sp.Symbol(name) for name in select_args_add]
+            self.func = sp.lambdify(syms + extra, exprs, modules=modules)
+            self.args = self.args + select_args_add
+
+    def evaluate(self, inputs, n):
+        if self.func is None:
+            return
+        out = self.func(*[inputs[name] for name in self.args])
+        for t, v in zip(self.terms, out):
+            v = np.broadcast_to(np.asarray(v), (n,))
+            t.value = (v.real if np.iscomplexobj(v) else v).astype(float)
+
+
+# Inputs of each model are refreshed once per evaluation round; see
+# `input_cache`.
+_INPUT_CACHE = None
+
+
+class input_cache:
+    """
+    Context manager that reuses model inputs within a block, for evaluating
+    several Jacobians at the same point.
+    """
+
+    def __enter__(self):
+        global _INPUT_CACHE
+        self._prev, _INPUT_CACHE = _INPUT_CACHE, {}
+        return self
+
+    def __exit__(self, *exc):
+        global _INPUT_CACHE
+        _INPUT_CACHE = self._prev
+        return False
+
+
 def _model_inputs(mdl, split):
     """Model inputs plus the real and imaginary parts of complex services."""
+    if _INPUT_CACHE is not None and id(mdl) in _INPUT_CACHE:
+        return _INPUT_CACHE[id(mdl)]
     inputs = dict(mdl.get_inputs(refresh=True))
     for name, (re_n, im_n) in split.items():
         v = np.asarray(mdl.__dict__[name].v)
         inputs[re_n], inputs[im_n] = np.real(v), np.imag(v)
+    if _INPUT_CACHE is not None:
+        _INPUT_CACHE[id(mdl)] = inputs
     return inputs
 
 
@@ -167,6 +228,11 @@ class _TermMaker:
     def __init__(self, mdl, known, modules):
         self.mdl, self.known, self.modules = mdl, known, modules
         self.unsupported = []
+        self.terms = []
+
+    def batch(self):
+        """A :class:`_TermBatch` of all terms made so far."""
+        return _TermBatch(self.terms, self.known, self.modules)
 
     def __call__(self, expr, sym, where):
         if isinstance(expr, (sp.logic.boolalg.BooleanFunction, sp.logic.boolalg.BooleanAtom,
@@ -178,7 +244,9 @@ class _TermMaker:
         if d.has(sp.Derivative) or d.has(sp.Subs):
             self.unsupported.append(f'{self.mdl.class_name}.{where} w.r.t. {sym}')
             return None
-        return _Term(d, self.known, self.modules)
+        t = _Term(d, self.known, self.modules, compile=False)
+        self.terms.append(t)
+        return t
 
 
 class _ModelParamJac:
@@ -261,6 +329,7 @@ class _ModelParamJac:
         self.d_services = OrderedDict(
             (name, derivative_terms(nodes[name][0], name)) for name in self.varying)
         self.unsupported = term.unsupported
+        self._term_maker = term
 
         self.eqs = []       # (variable instance, d_p, d_s)
         for var, expr in eq_exprs:
@@ -272,10 +341,13 @@ class _ModelParamJac:
         self.tconst = [(var, name) for var, name in tconsts
                        if name in self.params or name in self.varying]
 
+        self.batch = self._term_maker.batch()
         self.frozen = {}
 
     def _inputs(self):
-        return _model_inputs(self.mdl, self.split)
+        inputs = _model_inputs(self.mdl, self.split)
+        self.batch.evaluate(inputs, self.mdl.n)
+        return inputs
 
     def _service_derivatives(self, inputs, n, frozen):
         """
@@ -412,6 +484,7 @@ class _ModelTotalJac:
                        if var.t_const is not None
                        and (var.t_const.name in leaves or var.t_const.name in self.varying)]
         self.unsupported = term.unsupported
+        self.batch = term.batch()
 
     def triplets(self, totals):
         """
@@ -423,6 +496,7 @@ class _ModelTotalJac:
         """
         n = self.mdl.n
         inputs = _model_inputs(self.mdl, self.split)
+        self.batch.evaluate(inputs, n)
         totals = dict(totals)
         out = {'f': [], 'g': [], 'tf': []}
 
@@ -510,14 +584,20 @@ class _ModelVarServiceJac:
                 if t:
                     self.eqs.append((var, t))
         self.unsupported = term.unsupported
+        self.batch = term.batch()
 
-    def triplets(self):
-        """Return ``{'fx': [...], 'fy': [...], 'gx': [...], 'gy': [...]}`` triplet lists."""
+    def triplets(self, keep_zeros=False):
+        """
+        Return ``{'fx': [...], 'fy': [...], 'gx': [...], 'gy': [...]}`` triplet
+        lists. With ``keep_zeros``, entries that are zero at this point are
+        kept, so the pattern does not change between evaluations.
+        """
         out = {'fx': [], 'fy': [], 'gx': [], 'gy': []}
         if not self.eqs:
             return out
         n = self.mdl.n
         inputs = _model_inputs(self.mdl, self.split)
+        self.batch.evaluate(inputs, n)
 
         totals = {}                    # node -> {variable name: ds/dvar per device}
         for name, (d_var, d_node) in self.nodes.items():
@@ -537,7 +617,7 @@ class _ModelVarServiceJac:
             for v, vals in acc.items():
                 var = self.vars[v]
                 vals = np.broadcast_to(vals, (n,))
-                keep = vals != 0
+                keep = np.ones(n, dtype=bool) if keep_zeros else vals != 0
                 if np.any(keep):
                     out[eq.e_code + var.v_code].append(
                         (np.asarray(eq.a)[keep], np.asarray(var.a)[keep], vals[keep]))
@@ -561,9 +641,10 @@ def varservice_jacobian(system, models=None):
     -------
     callable
         ``evaluate()`` returns ``{'fx', 'fy', 'gx', 'gy'}`` SciPy CSR matrices
-        at the current state, to add to the ANDES Jacobians; and the
-        attribute ``evaluate.unsupported`` lists terms that could not be
-        differentiated.
+        at the current state, to add to the ANDES Jacobians.
+        ``evaluate.triplets()`` returns the same terms as ``(rows, cols,
+        vals)`` with a fixed pattern, zeros included. The attribute
+        ``evaluate.unsupported`` lists terms that could not be differentiated.
     """
     from scipy.sparse import coo_matrix
 
@@ -573,6 +654,20 @@ def varservice_jacobian(system, models=None):
     parts = [p for p in parts if p.eqs]
     n, m = system.dae.n, system.dae.m
     shapes = {'fx': (n, n), 'fy': (n, m), 'gx': (m, n), 'gy': (m, m)}
+
+    def triplets():
+        """Triplets ``{name: (rows, cols, vals)}`` with a fixed pattern (zeros kept)."""
+        trip = {k: [] for k in shapes}
+        for part in parts:
+            for k, items in part.triplets(keep_zeros=True).items():
+                trip[k].extend(items)
+        out = {}
+        for k in shapes:
+            if trip[k]:
+                out[k] = tuple(np.concatenate(x) for x in zip(*trip[k]))
+            else:
+                out[k] = (np.array([], dtype=int), np.array([], dtype=int), np.array([]))
+        return out
 
     def evaluate():
         trip = {k: [] for k in shapes}
@@ -590,6 +685,7 @@ def varservice_jacobian(system, models=None):
                 out[k] = coo_matrix(shape).tocsr()
         return out
 
+    evaluate.triplets = triplets
     evaluate.unsupported = [u for p in parts for u in p.unsupported]
     evaluate.models = [p.mdl.class_name for p in parts]
     return evaluate
@@ -810,11 +906,13 @@ class ParamJacobian:
         return coo_matrix((vals, (rows, cols)), shape=(nrows, len(self.pv))).tocsr()
 
     def _zero_pegged(self, fp):
-        pegged = [int(k) for item in self.system.antiwindups for key, _, _ in item.x_set
-                  for k in np.atleast_1d(key)]
-        if pegged:
-            fp = fp.tolil()
-            fp[pegged, :] = 0
-            fp = fp.tocsr()
-            fp.eliminate_zeros()
+        keys = [key for item in self.system.antiwindups for key, _, _ in item.x_set]
+        if not keys:
+            return fp
+        from scipy.sparse import diags
+
+        keep = np.ones(fp.shape[0])
+        keep[np.concatenate([np.atleast_1d(k) for k in keys]).astype(int)] = 0.0
+        fp = (diags(keep) @ fp).tocsr()
+        fp.eliminate_zeros()
         return fp
