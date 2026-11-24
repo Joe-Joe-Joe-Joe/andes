@@ -12,6 +12,15 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
 
 ## v2.0 Notes
 
+### Unreleased
+
+- Add `TDS.reinit(keep_params=True)` to re-initialize dynamic models from the
+  existing power flow solution after changing their parameters (inertia,
+  gains, time constants, event times, ...). Trajectories match a newly built
+  system with the same values, without parsing, setup or power flow.
+- Fix `Toggle` re-initialization overwriting the stored initial status with
+  1, which switched on devices that start offline.
+
 ### v2.0.0 (2026-03-11)
 
 Modeling framework changes:

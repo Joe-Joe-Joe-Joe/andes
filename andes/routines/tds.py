@@ -1161,7 +1161,7 @@ class TDS(BaseRoutine):
         self.qndf_cache = None
         self.initialized = False
 
-    def reinit(self):
+    def reinit(self, keep_params=False):
         """
         Reset TDS to post-init state for a new simulation episode.
 
@@ -1185,12 +1185,50 @@ class TDS(BaseRoutine):
         Restores: DAE state ``(x, y)``, device status ``(u, ue)``,
         ConstService values (setpoints, Fault flags), NumParam values
         (including those modified by ``Alter``), and observable variables.
+
+        Parameters
+        ----------
+        keep_params : bool, optional
+            If ``False`` (default), every parameter is restored to its value
+            at the end of :meth:`init`.
+
+            If ``True``, the current parameter values of dynamic models
+            (models that take part in TDS but not in power flow, such as
+            ``GENROU``, ``TGOV1`` or ``Fault``) are kept, and those models
+            are re-initialized from the existing power flow solution as
+            :meth:`init` would do. Services, initial values, time
+            constants and event times are re-derived from the new values,
+            and become the baseline for later calls to ``reinit()``.
+            This is equivalent to building a new system with these
+            parameter values, without parsing, setup or power flow::
+
+                ss.TDS.reinit()                      # back to t=0
+                ss.TGOV1.set('R', 'TGOV1_1', 0.04)   # change parameters
+                ss.Fault.set('tc', 1, 1.15)
+                ss.TDS.reinit(keep_params=True)      # re-initialize
+                ss.TDS.run()
+
+            Parameters must be changed at ``t = 0``, that is, after
+            :meth:`init` or a plain ``reinit()``, so that values written
+            during a run (for example by ``Alter``) are not mistaken for
+            new parameters. Parameters of power flow models (``Bus``,
+            ``Line``, ``PQ``, ``PV``, ...) change the power flow solution
+            and are not supported here; they are restored with a warning.
+            ``ExtParam`` copies of parameters (for example ``COI.M``) keep
+            the values taken at ``System.setup()``.
         """
         if not self.initialized:
             raise RuntimeError("Call TDS.init() before reinit()")
 
         system = self.system
         dae = system.dae
+
+        if keep_params and dae.t != 0:
+            raise RuntimeError("reinit(keep_params=True) must be called at t=0. "
+                               "Call reinit() first, then change parameters.")
+
+        if keep_params:
+            self._reinit_models()
 
         # 1. Restore the 2 essential arrays
         dae.x[:] = self._x_t0
@@ -1217,10 +1255,116 @@ class TDS(BaseRoutine):
                 np.put(dae.f, key, eqval)
 
         system.b_update(system.exist.pflow_tds)
+
+        if keep_params and self.config.test_init:
+            self.test_ok = self.test_init()
+            if self.test_ok is False:
+                logger.error("** Re-initialization with new parameters FAILED **")
+
         self.calc_h()
 
         # --- Episode bookkeeping ---
         system.exit_code = 0
+
+    def _reinit_models(self):
+        """
+        Re-initialize dynamic models from the power flow solution using the
+        current parameter values, then refresh the snapshots used by
+        :meth:`reinit`.
+
+        Mirrors the model initialization in :meth:`init` without rebuilding
+        addresses, sparsity patterns or the DAE compaction, which do not
+        depend on parameter values.
+        """
+        system = self.system
+        dae = system.dae
+        pflow = system.exist.pflow
+        dyn = OrderedDict((name, mdl) for name, mdl in system.exist.tds.items()
+                          if name not in pflow and mdl.n > 0)
+
+        # 1. keep current parameters of dynamic models; restore all else to t=0.
+        #    Power flow parameters cannot change without a new power flow.
+        #    Device status (`u`, `ue`) is always restored, since events such as
+        #    `Toggle` change it during a run.
+        kept = {name: [(p, p.v.copy()) for p in mdl.num_params.values()
+                       if p is not mdl.u and p is not getattr(mdl, 'ue', None)]
+                for name, mdl in dyn.items()}
+
+        changed = []
+        for name, mdl in system.exist.pflow_tds.items():
+            if mdl.n == 0 or name in dyn:
+                continue
+            for pname, p in mdl.num_params.items():
+                if p._v_t0 is not None and not np.array_equal(p.v, p._v_t0):
+                    changed.append(f'{name}.{pname}')
+
+        if changed:
+            logger.warning("reinit(keep_params=True) ignores changes to power flow "
+                           "parameters, which require a new power flow: %s",
+                           ', '.join(changed))
+
+        for mdl in system.exist.pflow_tds.values():
+            if mdl.n > 0:
+                mdl.restore_init()
+
+        for params in kept.values():
+            for p, v in params:
+                p.v[:] = v
+
+        # 2. start from the t=0 solution with zeroed dynamic variables, as in
+        #    `init()`, because model initialization adds into `dae.x` and `dae.y`
+        dae.x[:] = self._x_t0
+        dae.y[:] = self._y_t0
+        for mdl in dyn.values():
+            for var in mdl.cache.vars_int.values():
+                if var.n > 0:
+                    dae.__dict__[var.v_code][var.a] = 0.0
+        dae.set_t(0.0)
+
+        # 3. re-initialize dynamic models in the original order. As in
+        #    `init()`, only the light getters/setters are active, and models
+        #    count as uninitialized until their turn, so that `vars_to_dae`
+        #    does not write values of models not yet initialized.
+        for mdl in dyn.values():
+            mdl.flags.initialized = False
+        system.store_getters(models=system.exist.pflow_tds)
+        system.vars_to_models()
+
+        system.codegen._init_numba(dyn)
+        for mdl in dyn.values():
+            # Services from power flow models keep their t=0 values: the
+            # power flow solution is unchanged, and the variables of static
+            # devices replaced by dynamic ones are no longer stored in `dae`.
+            for instance in mdl.services_ext.values():
+                ext_model = system.__dict__[instance.model]
+                is_group = hasattr(ext_model, '_idx2model')
+                sources = ext_model.models.values() if is_group else [ext_model]
+                if all(src.class_name in pflow for src in sources):
+                    continue
+                instance.link_external(ext_model)
+
+            mdl.init(routine='tds')
+            system.vars_to_dae(mdl)
+            system.vars_to_models()
+
+        system.store_adder_setter(models=system.exist.pflow_tds)
+        system.vars_to_models()
+
+        system.s_update_post(dyn)
+        system._store_tf(dyn)
+        self.Teye = spdiag(dae.Tf.tolist())
+
+        # 4. event times may have changed
+        system.switch_dict.clear()
+        if self.data_csv is None:
+            system.store_switch_times(system.exist.tds)
+
+        # 5. the new state becomes the baseline for `reinit()`
+        self._x_t0 = dae.x.copy()
+        self._y_t0 = dae.y.copy()
+        for mdl in system.exist.pflow_tds.values():
+            if mdl.n > 0:
+                mdl.snapshot_init()
 
     def rewind(self, t):
         """

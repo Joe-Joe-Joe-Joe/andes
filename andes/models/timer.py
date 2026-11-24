@@ -64,7 +64,11 @@ class Toggle(ToggleData, Model):
                 instance = self.system.__dict__[self.model.v[i]]
                 self._u.v[i] = instance.get(src='u', attr='v', idx=self.dev.v[i])
                 self._init = True
+            self._u0 = self._u.v.copy()
         else:
+            # `_u` is re-evaluated to its default by `s_update()` on every
+            # init; restore the status stored at the first init
+            self._u.v[:] = self._u0
             for i in range(self.n):
                 self.system.set_status(self.model.v[i], self.dev.v[i],
                                        self._u.v[i])
