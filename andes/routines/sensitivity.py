@@ -97,10 +97,17 @@ class TrajectorySensitivity:
     takes ``8 * n_steps * (dae.n + dae.m) * len(pv)`` bytes. Event times
     (``Fault.tc``, ``Toggle.t``) and parameters of power flow models are
     not supported. Switching of limiters between steps is not located in
-    time, as in the simulation itself.
+    time, as in the simulation itself. At a parameter value where the model
+    changes structure, such as a zero resistance or time constant, the
+    derivative is one-sided.
 
     Attributes
     ----------
+    inconsistent : list of str
+        Entries of ``pv`` whose change leaves the initialization out of
+        balance with the power flow (for example ``GENROU.gammap`` or
+        ``TGOV1.wref0``): ``t=0`` is then not an equilibrium, and their
+        sensitivities are not meaningful.
     S0 : np.ndarray
         Initial sensitivities, shape ``(dae.n + dae.m, len(pv))``.
     t : np.ndarray
@@ -188,6 +195,7 @@ class TrajectorySensitivity:
 
         S0 = np.zeros((dae.n + dae.m, n_p))
         base = self._constants()
+        self.inconsistent = []
         totals = {m: {s: np.zeros((v.size, n_p), dtype=v.dtype) for s, v in d.items()}
                   for m, d in base.items()}
 
@@ -200,9 +208,12 @@ class TrajectorySensitivity:
                     p[j] += sign * h
                     pv.set(p)
                     ss.TDS.reinit(keep_params=True)
-                    runs.append((dae.xy.copy(), self._constants()))
-                (xy_p, c_p), (xy_m, c_m) = runs
+                    runs.append((dae.xy.copy(), self._constants(), self._init_residual()))
+                (xy_p, c_p, r_p), (xy_m, c_m, r_m) = runs
                 S0[:, j] = (xy_p - xy_m) / (2 * h)
+                # an equilibrium stays an equilibrium: d(f, g)/dp at t=0 is zero
+                if np.max(np.abs(r_p - r_m)) / (2 * h) > 1e-3:
+                    self.inconsistent.append(pv.names[j])
                 for m, d in totals.items():
                     for s, arr in d.items():
                         arr[:, j] = (c_p[m][s] - c_m[m][s]) / (2 * h)
@@ -210,10 +221,24 @@ class TrajectorySensitivity:
             pv.set(p0)
             ss.TDS.reinit(keep_params=True)
 
+        if self.inconsistent:
+            logger.warning("TrajectorySensitivity: after changing these parameters, the "
+                           "initialization no longer matches the power flow, so t=0 is not an "
+                           "equilibrium and their sensitivities are not meaningful: %s",
+                           ', '.join(self.inconsistent))
+
         # keep only constants that move
         totals = {m: {s: a for s, a in d.items() if np.any(a)} for m, d in totals.items()}
         totals = {m: d for m, d in totals.items() if d}
         return S0, totals
+
+    def _init_residual(self):
+        """Residuals at the current (initial) point, as checked by ``TDS.test_init``."""
+        ss = self.system
+        ss.TDS.fg_update(ss.exist.pflow_tds)
+        fg = ss.dae.fg.copy()
+        fg[np.asarray(ss.no_check_init, dtype=int)] = 0.0
+        return fg
 
     def _pinned_limits(self):
         """

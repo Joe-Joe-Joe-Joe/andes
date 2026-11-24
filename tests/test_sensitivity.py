@@ -120,6 +120,16 @@ class TestSensitivityFault(SensitivityCase):
               ('TGOV1', 'R', 'TGOV1_1'), ('Fault', 'xf', 1)]
 
 
+class TestSensitivityInconsistent(unittest.TestCase):
+
+    def test_flags_setpoint_parameters(self):
+        """Changing ``gammap`` or ``wref0`` breaks the initial equilibrium."""
+        ss = _load('kundur/kundur_full.xlsx', tf=0.1)
+        pv = ParamVector(ss, [('GENROU', 'gammap', 2), ('GENROU', 'M', 2), ('TGOV1', 'wref0', 2)])
+        sens = TrajectorySensitivity(ss, pv)
+        self.assertEqual(sens.inconsistent, ['GENROU.gammap[2]', 'TGOV1.wref0[2]'])
+
+
 class TestSensitivityErrors(unittest.TestCase):
 
     @classmethod
