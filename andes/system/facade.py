@@ -202,11 +202,13 @@ class System:
 
     def _clear_adder_setter(self):
         """
-        Clear adders and setters storage
+        Clear adders and setters storage, and the list of anti-windup
+        limiters, which :meth:`store_adder_setter` collects again.
         """
         self._getters = dict(f=list(), g=list(), x=list(), y=list())
         self._adders = dict(f=list(), g=list(), x=list(), y=list())
         self._setters = dict(f=list(), g=list(), x=list(), y=list())
+        self.antiwindups = list()
 
     def prepare(self, quick=False, incremental=False, models=None, nomp=False, ncpu=NCPUS):
         """

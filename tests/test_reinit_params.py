@@ -107,6 +107,15 @@ class TestReinitParamsKundur(ReinitParamsBase):
         ss.TDS.reinit(keep_params=True)
         self.assert_same(self.base, _run(ss), atol=1e-12)
 
+    def test_no_growth(self):
+        """Repeated re-initialization does not duplicate limiters or lists."""
+        ss = self.ss
+        sizes = (len(ss.antiwindups), {k: len(v) for k, v in ss._adders.items()})
+        for _ in range(3):
+            ss.TDS.reinit()
+            ss.TDS.reinit(keep_params=True)
+        self.assertEqual((len(ss.antiwindups), {k: len(v) for k, v in ss._adders.items()}), sizes)
+
     def test_pflow_param_change_is_ignored(self):
         ss = self.ss
         p0 = ss.PQ.get('p0', 'PQ_0')
