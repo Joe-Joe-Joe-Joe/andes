@@ -28,6 +28,15 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
   trajectory sensitivity analysis. Derivatives follow the chain through the
   `ConstService` and `VarService` expressions of each model, with complex
   services split into real and imaginary parts.
+- Add `andes.routines.sensitivity.TrajectorySensitivity` for forward
+  trajectory sensitivities `dx/dp` and `dy/dp` along a time-domain
+  simulation with the trapezoidal method. Each step solves one sparse linear
+  system with the step's Jacobian at the converged point, including the
+  terms through `VarService` values that the Newton Jacobians leave out.
+  Initial sensitivities and the derivatives of initialization setpoints are
+  computed by central differences of `TDS.reinit(keep_params=True)`.
+- Add `andes.core.paramjac.varservice_jacobian` for the Jacobian terms that
+  pass through `VarService` values.
 - Fix `Toggle` re-initialization overwriting the stored initial status with
   1, which switched on devices that start offline.
 

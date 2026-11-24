@@ -16,7 +16,7 @@ from collections import OrderedDict
 import sympy as sp
 from sympy.core.function import AppliedUndef
 
-from andes.core.service import PostInitService, VarService
+from andes.core.service import BaseService, PostInitService, VarService
 from andes.core.symprocessor import SymProcessor, select_args_add
 from andes.shared import np
 
@@ -104,6 +104,83 @@ class _Term:
         return out.astype(float)
 
 
+def _model_symbols(mdl):
+    """
+    Symbols and an expression parser for one model.
+
+    Complex services ``c`` are written as ``c__re + I * c__im`` with two real
+    symbols, so that expressions are real and SymPy can differentiate
+    ``re``, ``im``, ``conj``, ``abs`` and ``arg`` of them.
+
+    Returns
+    -------
+    known : OrderedDict
+        Name -> symbol, including the ``__re``/``__im`` symbols.
+    modules : list
+        ``modules`` argument for ``lambdify``.
+    split : OrderedDict
+        Complex service name -> ``(re name, im name)``.
+    parse : callable
+        Parses an equation or service string.
+    """
+    syms = SymProcessor(mdl)
+    syms.generate_symbols()
+    syms.generate_subs_expr()
+    known = OrderedDict(syms.inputs_dict)
+
+    split = OrderedDict()
+    to_real = {}
+    for name in known.copy():
+        instance = mdl.__dict__.get(name)
+        if isinstance(instance, BaseService) and getattr(instance, 'vtype', float) == complex:
+            re_s = sp.Symbol(f'{name}__re', real=True)
+            im_s = sp.Symbol(f'{name}__im', real=True)
+            known[re_s.name], known[im_s.name] = re_s, im_s
+            to_real[known[name]] = re_s + sp.I * im_s
+            split[name] = (re_s.name, im_s.name)
+
+    def parse(string):
+        expr = sp.sympify(string, locals=syms.inputs_dict)
+        expr = _expand_helpers(syms._do_substitute(expr))
+        return _substitute(expr, to_real)
+
+    return known, syms.lambdify_func, split, parse
+
+
+def _split_complex(expr):
+    """Real and imaginary parts of an expression in real symbols."""
+    return sp.expand_complex(sp.re(expr)), sp.expand_complex(sp.im(expr))
+
+
+def _model_inputs(mdl, split):
+    """Model inputs plus the real and imaginary parts of complex services."""
+    inputs = dict(mdl.get_inputs(refresh=True))
+    for name, (re_n, im_n) in split.items():
+        v = np.asarray(mdl.__dict__[name].v)
+        inputs[re_n], inputs[im_n] = np.real(v), np.imag(v)
+    return inputs
+
+
+class _TermMaker:
+    """Builds lambdified derivative terms and records what cannot be differentiated."""
+
+    def __init__(self, mdl, known, modules):
+        self.mdl, self.known, self.modules = mdl, known, modules
+        self.unsupported = []
+
+    def __call__(self, expr, sym, where):
+        if isinstance(expr, (sp.logic.boolalg.BooleanFunction, sp.logic.boolalg.BooleanAtom,
+                             sp.core.relational.Relational)):
+            return None       # a true/false flag: piecewise constant
+        d = _diff(expr, sym)
+        if d == 0:
+            return None
+        if d.has(sp.Derivative) or d.has(sp.Subs):
+            self.unsupported.append(f'{self.mdl.class_name}.{where} w.r.t. {sym}')
+            return None
+        return _Term(d, self.known, self.modules)
+
+
 class _ModelParamJac:
     """
     Symbolic parameter derivatives for one model.
@@ -118,29 +195,8 @@ class _ModelParamJac:
     def __init__(self, mdl, params):
         self.mdl = mdl
         self.params = list(params)
-        self.unsupported = []
 
-        syms = SymProcessor(mdl)
-        syms.generate_symbols()
-        syms.generate_subs_expr()
-        known = OrderedDict(syms.inputs_dict)
-        modules = syms.lambdify_func
-
-        # complex services -> real and imaginary symbols
-        self.split = OrderedDict()     # complex service name -> (re name, im name)
-        to_real = {}
-        for name, instance in mdl.services.items():
-            if instance.vtype == complex:
-                re_s = sp.Symbol(f'{name}__re', real=True)
-                im_s = sp.Symbol(f'{name}__im', real=True)
-                known[re_s.name], known[im_s.name] = re_s, im_s
-                to_real[known[name]] = re_s + sp.I * im_s
-                self.split[name] = (re_s.name, im_s.name)
-
-        def parse(string):
-            expr = sp.sympify(string, locals=syms.inputs_dict)
-            expr = _expand_helpers(syms._do_substitute(expr))
-            return _substitute(expr, to_real)
+        known, modules, self.split, parse = _model_symbols(mdl)
 
         psyms = {p: known[p] for p in self.params}
 
@@ -153,7 +209,7 @@ class _ModelParamJac:
             expr = parse(instance.v_str)
             is_var = isinstance(instance, VarService)
             if name in self.split:
-                re_e, im_e = (sp.expand_complex(sp.re(expr)), sp.expand_complex(sp.im(expr)))
+                re_e, im_e = _split_complex(expr)
                 re_n, im_n = self.split[name]
                 nodes[re_n] = (re_e, is_var)
                 nodes[im_n] = (im_e, is_var)
@@ -184,17 +240,7 @@ class _ModelParamJac:
                 self.varying[name] = is_var
                 reach.add(known[name])
 
-        def term(expr, sym, where):
-            if isinstance(expr, (sp.logic.boolalg.BooleanFunction, sp.logic.boolalg.BooleanAtom,
-                                 sp.core.relational.Relational)):
-                return None       # a true/false flag: piecewise constant
-            d = _diff(expr, sym)
-            if d == 0:
-                return None
-            if d.has(sp.Derivative) or d.has(sp.Subs):
-                self.unsupported.append(f'{mdl.class_name}.{where} w.r.t. {sym}')
-                return None
-            return _Term(d, known, modules)
+        term = _TermMaker(mdl, known, modules)
 
         def derivative_terms(expr, where):
             """Terms of d(expr)/dp, split into parameter and node parts."""
@@ -214,6 +260,7 @@ class _ModelParamJac:
 
         self.d_services = OrderedDict(
             (name, derivative_terms(nodes[name][0], name)) for name in self.varying)
+        self.unsupported = term.unsupported
 
         self.eqs = []       # (variable instance, d_p, d_s)
         for var, expr in eq_exprs:
@@ -228,12 +275,7 @@ class _ModelParamJac:
         self.frozen = {}
 
     def _inputs(self):
-        """Model inputs plus the real and imaginary parts of complex services."""
-        inputs = dict(self.mdl.get_inputs(refresh=True))
-        for name, (re_n, im_n) in self.split.items():
-            v = np.asarray(self.mdl.services[name].v)
-            inputs[re_n], inputs[im_n] = np.real(v), np.imag(v)
-        return inputs
+        return _model_inputs(self.mdl, self.split)
 
     def _service_derivatives(self, inputs, n, frozen):
         """
@@ -299,6 +341,260 @@ class _ModelParamJac:
         return out
 
 
+class _ModelTotalJac:
+    """
+    Parameter derivatives for one model, given the total derivatives of its
+    constants.
+
+    Every service that is not a ``VarService`` (``ConstService``,
+    ``ExtService``, ``PostInitService``, ...) is a constant whose total
+    derivative ``dc/dp`` over all columns is supplied by the caller, for
+    example from the sensitivity of the initialization. ``VarService``
+    values follow the chain at evaluation time. All totals are dense arrays
+    of shape ``(n_devices, n_columns)``.
+    """
+
+    def __init__(self, mdl, params):
+        self.mdl = mdl
+        self.params = list(params)
+        known, modules, self.split, parse = _model_symbols(mdl)
+
+        # constants: services other than VarService; complex ones split
+        self.consts = []          # node names
+        for name in known:
+            instance = mdl.__dict__.get(name)
+            if not isinstance(instance, BaseService) or isinstance(instance, VarService):
+                continue
+            self.consts.extend(self.split.get(name, (name,)))
+
+        leaves = {name: known[name] for name in self.params + self.consts}
+
+        nodes = OrderedDict()
+        for name, instance in mdl.services_var.items():
+            if instance.v_str is None or instance.v_numeric is not None:
+                continue
+            expr = parse(instance.v_str)
+            if name in self.split:
+                for node, e in zip(self.split[name], _split_complex(expr)):
+                    nodes[node] = e
+            else:
+                nodes[name] = expr
+
+        term = _TermMaker(mdl, known, modules)
+
+        def terms(expr, where, names):
+            out = OrderedDict()
+            fs = expr.free_symbols
+            for name in names:
+                if known[name] in fs:
+                    t = term(expr, known[name], where)
+                    if t is not None:
+                        out[name] = t
+            return out
+
+        # VarServices that depend on leaves, directly or through others
+        self.varying = OrderedDict()
+        reach = set(leaves.values())
+        for name, expr in nodes.items():
+            if expr.free_symbols & reach:
+                self.varying[name] = terms(expr, name, list(leaves) + list(self.varying))
+                reach.add(known[name])
+
+        self.eqs = []
+        for var in list(mdl.cache.states_and_ext.values()) + list(mdl.cache.algebs_and_ext.values()):
+            if var.e_str is None:
+                continue
+            t = terms(parse(var.e_str), var.name, list(leaves) + list(self.varying))
+            if t:
+                self.eqs.append((var, t))
+
+        self.tconst = [(var, var.t_const.name) for var in mdl.states.values()
+                       if var.t_const is not None
+                       and (var.t_const.name in leaves or var.t_const.name in self.varying)]
+        self.unsupported = term.unsupported
+
+    def triplets(self, totals):
+        """
+        Return ``(f, g, tf)`` lists of ``(rows, cols, vals)`` triplets.
+
+        ``totals`` maps each parameter and constant node of the model to
+        its total derivative, an array of shape ``(n_devices, n_columns)``.
+        Missing names count as zero.
+        """
+        n = self.mdl.n
+        inputs = _model_inputs(self.mdl, self.split)
+        totals = dict(totals)
+        out = {'f': [], 'g': [], 'tf': []}
+
+        def combine(parts):
+            acc = None
+            for name, t in parts.items():
+                tot = totals.get(name)
+                if tot is None:
+                    continue
+                contrib = t(inputs, n)[:, None] * tot
+                acc = contrib if acc is None else acc + contrib
+            return acc
+
+        for name, parts in self.varying.items():
+            acc = combine(parts)
+            if acc is not None:
+                totals[name] = acc
+
+        def add(kind, rows, mat):
+            if mat is None:
+                return
+            i, j = np.nonzero(mat)
+            if i.size:
+                out[kind].append((np.asarray(rows)[i], j, mat[i, j]))
+
+        for var, parts in self.eqs:
+            add(var.e_code, var.a, combine(parts))
+        for var, name in self.tconst:
+            add('tf', var.a, totals.get(name))
+        return out
+
+
+class _ModelVarServiceJac:
+    """
+    Jacobian terms through the ``VarService`` values of one model.
+
+    ANDES evaluates ``VarService`` values from the variables at every
+    iteration but treats them as constants in its symbolic Jacobians, which
+    is enough for Newton's method. This class gives the missing terms
+    ``de/ds * ds/d(x, y)`` for each ``VarService`` ``s``, chained through
+    earlier ``VarService`` values.
+    """
+
+    def __init__(self, mdl):
+        self.mdl = mdl
+        known, modules, self.split, parse = _model_symbols(mdl)
+        self.vars = OrderedDict((name, var) for name, var in mdl.cache.all_vars.items())
+
+        nodes = OrderedDict()
+        for name, instance in mdl.services_var.items():
+            if instance.v_str is None or instance.v_numeric is not None:
+                continue
+            expr = parse(instance.v_str)
+            if name in self.split:
+                for node, e in zip(self.split[name], _split_complex(expr)):
+                    nodes[node] = e
+            else:
+                nodes[name] = expr
+
+        term = _TermMaker(mdl, known, modules)
+        var_syms = {known[name]: name for name in self.vars if name in known}
+
+        # nodes that depend on variables, directly or through earlier nodes
+        self.nodes = OrderedDict()     # node -> (var terms, node terms)
+        reach = set(var_syms)
+        for name, expr in nodes.items():
+            fs = expr.free_symbols
+            if not fs & reach:
+                continue
+            d_var = OrderedDict((var_syms[sym], t) for sym in fs & set(var_syms)
+                                for t in [term(expr, sym, name)] if t is not None)
+            d_node = OrderedDict((k, t) for k in self.nodes if known[k] in fs
+                                 for t in [term(expr, known[k], name)] if t is not None)
+            self.nodes[name] = (d_var, d_node)
+            reach.add(known[name])
+
+        self.eqs = []                  # (equation variable, {node: term})
+        if self.nodes:
+            for var in list(mdl.cache.states_and_ext.values()) + list(mdl.cache.algebs_and_ext.values()):
+                if var.e_str is None:
+                    continue
+                expr = parse(var.e_str)
+                t = OrderedDict((k, tt) for k in self.nodes if known[k] in expr.free_symbols
+                                for tt in [term(expr, known[k], var.name)] if tt is not None)
+                if t:
+                    self.eqs.append((var, t))
+        self.unsupported = term.unsupported
+
+    def triplets(self):
+        """Return ``{'fx': [...], 'fy': [...], 'gx': [...], 'gy': [...]}`` triplet lists."""
+        out = {'fx': [], 'fy': [], 'gx': [], 'gy': []}
+        if not self.eqs:
+            return out
+        n = self.mdl.n
+        inputs = _model_inputs(self.mdl, self.split)
+
+        totals = {}                    # node -> {variable name: ds/dvar per device}
+        for name, (d_var, d_node) in self.nodes.items():
+            tot = {v: t(inputs, n).copy() for v, t in d_var.items()}
+            for k, t in d_node.items():
+                dk = t(inputs, n)
+                for v, val in totals[k].items():
+                    tot[v] = tot.get(v, 0.0) + dk * val
+            totals[name] = tot
+
+        for eq, parts in self.eqs:
+            acc = {}
+            for k, t in parts.items():
+                de = t(inputs, n)
+                for v, val in totals[k].items():
+                    acc[v] = acc.get(v, 0.0) + de * val
+            for v, vals in acc.items():
+                var = self.vars[v]
+                vals = np.broadcast_to(vals, (n,))
+                keep = vals != 0
+                if np.any(keep):
+                    out[eq.e_code + var.v_code].append(
+                        (np.asarray(eq.a)[keep], np.asarray(var.a)[keep], vals[keep]))
+        return out
+
+
+def varservice_jacobian(system, models=None):
+    """
+    Build an evaluator for the Jacobian terms that pass through
+    ``VarService`` values, which ANDES leaves out of ``fx``, ``fy``, ``gx``
+    and ``gy``.
+
+    Parameters
+    ----------
+    system : System
+        A system after ``TDS.init()``.
+    models : dict, optional
+        Models to include. Default: ``system.exist.pflow_tds``.
+
+    Returns
+    -------
+    callable
+        ``evaluate()`` returns ``{'fx', 'fy', 'gx', 'gy'}`` SciPy CSR matrices
+        at the current state, to add to the ANDES Jacobians; and the
+        attribute ``evaluate.unsupported`` lists terms that could not be
+        differentiated.
+    """
+    from scipy.sparse import coo_matrix
+
+    models = system.exist.pflow_tds if models is None else models
+    parts = [_ModelVarServiceJac(mdl) for mdl in models.values()
+             if mdl.n > 0 and len(mdl.services_var) > 0]
+    parts = [p for p in parts if p.eqs]
+    n, m = system.dae.n, system.dae.m
+    shapes = {'fx': (n, n), 'fy': (n, m), 'gx': (m, n), 'gy': (m, m)}
+
+    def evaluate():
+        trip = {k: [] for k in shapes}
+        for part in parts:
+            for k, items in part.triplets().items():
+                trip[k].extend(items)
+        out = {}
+        for k, shape in shapes.items():
+            if trip[k]:
+                rows = np.concatenate([r for r, _, _ in trip[k]])
+                cols = np.concatenate([c for _, c, _ in trip[k]])
+                vals = np.concatenate([v for _, _, v in trip[k]])
+                out[k] = coo_matrix((vals, (rows, cols)), shape=shape).tocsr()
+            else:
+                out[k] = coo_matrix(shape).tocsr()
+        return out
+
+    evaluate.unsupported = [u for p in parts for u in p.unsupported]
+    evaluate.models = [p.mdl.class_name for p in parts]
+    return evaluate
+
+
 class ParamJacobian:
     """
     Jacobians of the DAE residuals with respect to a :class:`ParamVector`.
@@ -324,6 +620,14 @@ class ParamJacobian:
         A system on which ``TDS.init()`` has been called.
     pv : ParamVector
         The parameters; columns of the Jacobians follow its order.
+    const_totals : dict, optional
+        Total derivatives of the constants of dynamic models, as
+        ``{model: {service: array of shape (n_devices, len(pv))}}``, for
+        example from :class:`andes.routines.sensitivity.TrajectorySensitivity`.
+        With it, every non-``VarService`` service, including ``ExtService``
+        and ``PostInitService`` values set from the initial state, carries
+        its given derivative, and constants of models without parameters
+        in ``pv`` are included too. Missing entries count as zero.
 
     Notes
     -----
@@ -349,7 +653,7 @@ class ParamJacobian:
     >>> fp, gp = pj.evaluate()       # scipy.sparse, (dae.n, len(pv)), (dae.m, len(pv))
     """
 
-    def __init__(self, system, pv):
+    def __init__(self, system, pv, const_totals=None):
         if not system.TDS.initialized:
             raise RuntimeError("ParamJacobian requires TDS.init().")
         if pv.system is not system:
@@ -359,6 +663,11 @@ class ParamJacobian:
         self.pv = pv
         self.unsupported = []
         self.nonfinite = []
+        self.const_totals = None
+
+        if const_totals is not None:
+            self._init_totals(const_totals)
+            return
 
         self._models = OrderedDict()   # model name -> (_ModelParamJac, cols)
         for (mname, pname), (mdl, _, uid, sl) in pv._blocks.items():
@@ -383,6 +692,44 @@ class ParamJacobian:
 
         self.freeze()
 
+    def _init_totals(self, const_totals):
+        """Set up the mode where constants have given total derivatives."""
+        system, pv = self.system, self.pv
+        ncol = len(pv)
+
+        own = {}                           # model -> {param: one-hot totals}
+        for (mname, pname), (mdl, _, uid, sl) in pv._blocks.items():
+            tot = np.zeros((mdl.n, ncol))
+            tot[uid, np.arange(sl.start, sl.stop)] = 1.0
+            own.setdefault(mname, {})[pname] = tot
+
+        self._totals = OrderedDict()       # model -> (_ModelTotalJac, totals)
+        for mname, mdl in system.exist.tds.items():
+            if mdl.n == 0 or mname in system.exist.pflow:
+                continue
+            given = const_totals.get(mname, {})
+            if mname not in own and not given:
+                continue
+            mtj = _ModelTotalJac(mdl, own.get(mname, {}).keys())
+            totals = dict(own.get(mname, {}))
+            for name, tot in given.items():
+                tot = np.asarray(tot)
+                if name in mtj.split:
+                    re_n, im_n = mtj.split[name]
+                    totals[re_n], totals[im_n] = np.real(tot), np.imag(tot)
+                else:
+                    totals[name] = np.real(tot)
+            for flag in ('f_num', 'g_num'):
+                if getattr(mdl.flags, flag, False):
+                    self.unsupported.append(f'{mname}.{flag[0]}_numeric')
+            self.unsupported.extend(mtj.unsupported)
+            self._totals[mname] = (mtj, totals)
+
+        self.const_totals = const_totals
+        if self.unsupported:
+            logger.warning("ParamJacobian: not differentiated (taken as zero): %s",
+                           '; '.join(self.unsupported))
+
     def freeze(self):
         """
         Evaluate the ``ConstService`` derivatives at the current state.
@@ -390,6 +737,8 @@ class ParamJacobian:
         Called at construction. Call again at ``t=0`` after
         ``TDS.reinit(keep_params=True)`` with new parameter values.
         """
+        if self.const_totals is not None:
+            return                 # constants have given totals
         if self.system.dae.t != 0:
             raise RuntimeError("ParamJacobian.freeze() must be called at t=0.")
         for mpj, _ in self._models.values():
@@ -438,6 +787,11 @@ class ParamJacobian:
 
     def _collect(self):
         out = {'f': [], 'g': [], 'tf': []}
+        if self.const_totals is not None:
+            for mtj, totals in self._totals.values():
+                for kind, items in mtj.triplets(totals).items():
+                    out[kind].extend(items)
+            return out
         for mpj, cols in self._models.values():
             for kind, items in mpj.triplets(cols).items():
                 out[kind].extend(items)
