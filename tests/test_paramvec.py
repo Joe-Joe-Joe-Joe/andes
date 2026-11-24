@@ -107,6 +107,65 @@ class TestParamVectorLayout(unittest.TestCase):
             ParamVector(ss, ['GENROU.M'])
 
 
+class TestParamVectorAll(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ss = _load()
+
+    def test_all_contents(self):
+        ss = self.ss
+        pv = ParamVector.all(ss)
+        params = set(zip(pv.model, pv.param))
+
+        expected = 0
+        for mname, mdl in ss.models.items():
+            if mdl.n == 0:
+                continue
+            for pname, p in mdl.num_params.items():
+                if ParamVector._unusable(mdl, p) is None:
+                    expected += mdl.n
+                    self.assertIn((mname, pname), params)
+        self.assertEqual(len(pv), expected)
+
+        self.assertIn(('GENROU', 'M'), params)
+        self.assertIn(('Line', 'x'), params)
+        self.assertIn(('Toggle', 't'), params)
+        for left_out in [('GENROU', 'u'), ('GENROU', 'ue'), ('TGOV1', 'Sg')]:
+            self.assertNotIn(left_out, params)
+
+        np.testing.assert_array_equal(pv.get()[pv.index('GENROU', 'M')], ss.GENROU.M.v)
+
+    def test_all_without_pflow(self):
+        pv = ParamVector.all(self.ss, pflow=False)
+        self.assertFalse(pv.pflow.any())
+        self.assertNotIn('Line', pv.model)
+        self.assertIn('GENROU', pv.model)
+        self.assertEqual(len(pv), int(np.sum(~ParamVector.all(self.ss).pflow)))
+
+    def test_all_models_filter(self):
+        pv = ParamVector.all(self.ss, models=['TGOV1', 'GENROU'])
+        self.assertEqual(set(pv.model), {'TGOV1', 'GENROU'})
+        self.assertEqual(pv.model[0], 'GENROU')   # System.models order, not argument order
+        with self.assertRaises(KeyError):
+            ParamVector.all(self.ss, models=['NOPE'])
+
+    def test_subset(self):
+        pv = ParamVector.all(self.ss)
+        dyn = pv.subset(~pv.pflow)
+        self.assertEqual(dyn.names, [n for n, f in zip(pv.names, pv.pflow) if not f])
+        np.testing.assert_array_equal(dyn.get(), pv.get()[~pv.pflow])
+
+        pos = [pv.index('TGOV1', 'R', 3), pv.index('GENROU', 'M', 2), pv.index('TGOV1', 'R', 1)]
+        sub = pv.subset(pos)
+        self.assertEqual(sub.names, ['TGOV1.R[3]', 'TGOV1.R[1]', 'GENROU.M[2]'])
+        self.assertEqual(len(pv.subset(np.zeros(len(pv), dtype=bool))), 0)
+        with self.assertRaises(ValueError):
+            pv.subset([True, False])
+        with self.assertRaises(IndexError):
+            pv.subset([len(pv)])
+
+
 class TestParamVectorSet(unittest.TestCase):
 
     def setUp(self):
@@ -142,6 +201,25 @@ class TestParamVectorSet(unittest.TestCase):
         pv = ParamVector(self.ss, ['GENROU.M'])
         with self.assertRaises(ValueError):
             pv.set([1.0, 2.0])
+
+    def test_all_round_trip(self):
+        """Writing back every value of the whole vector changes nothing."""
+        ss = self.ss
+        ss.TDS.run(no_summary=True)
+        ss.dae.ts.unpack()
+        base = np.hstack([ss.dae.ts.x, ss.dae.ts.y])
+        ss.TDS.reinit()
+
+        pv = ParamVector.all(ss, pflow=False)
+        before = {(m, p): ss.__dict__[m].__dict__[p].v.copy() for m, p in set(zip(pv.model, pv.param))}
+        pv.set(pv.get())
+        for (m, p), v in before.items():
+            np.testing.assert_array_equal(ss.__dict__[m].__dict__[p].v, v)
+
+        ss.TDS.reinit(keep_params=True)
+        ss.TDS.run(no_summary=True)
+        ss.dae.ts.unpack()
+        np.testing.assert_allclose(np.hstack([ss.dae.ts.x, ss.dae.ts.y]), base, rtol=0, atol=1e-12)
 
     def test_set_and_reinit_matches_model_set(self):
         """``set`` + ``reinit(keep_params=True)`` gives the same run as ``Model.set``."""

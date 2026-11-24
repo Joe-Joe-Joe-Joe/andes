@@ -21,6 +21,8 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
 - Add `andes.core.ParamVector`, a flat vector view of selected numerical
   parameters across models with `get()`/`set()` in system or device base,
   entry names, positions and metadata, for optimizers and sensitivity studies.
+  `ParamVector.all(ss)` collects every numerical parameter of the system
+  (`pflow=False` for dynamic models only), and `subset()` narrows it down.
 - Fix `Toggle` re-initialization overwriting the stored initial status with
   1, which switched on devices that start offline.
 

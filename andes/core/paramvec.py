@@ -28,6 +28,9 @@ class ParamVector:
     (``Model.<param>.v``), so the vector is not a copy of the data: the
     models remain the single source of truth.
 
+    Use :meth:`all` for a vector of every parameter in the system, and
+    :meth:`subset` to narrow a vector down.
+
     After writing new values, call ``TDS.reinit(keep_params=True)`` (dynamic
     models) or run the power flow again (power flow models) for the change to
     take effect; see :attr:`pflow` for which entries need which.
@@ -142,19 +145,117 @@ class ParamVector:
             raise KeyError(f"<{mname}> is not a model.")
 
         instance = mdl.__dict__.get(pname)
-        if not isinstance(instance, NumParam):
-            raise ValueError(f"{mname}.{pname} is not a numerical parameter (NumParam).")
-        if isinstance(instance, ExtParam):
-            raise ValueError(f"{mname}.{pname} is an ExtParam, a copy of "
-                             f"{instance.model}.{instance.src}; select the source instead.")
-        if instance is mdl.u or instance is getattr(mdl, 'ue', None):
-            raise ValueError(f"{mname}.{pname} is the device status; "
-                             "use System.set_status() instead.")
-        if not isinstance(instance.v, np.ndarray) or instance.v.dtype.kind != 'f' \
-                or instance.v.ndim != 1:
-            raise ValueError(f"{mname}.{pname} does not hold one float per device.")
+        reason = self._unusable(mdl, instance)
+        if reason is not None:
+            raise ValueError(f"{mname}.{pname} {reason}.")
 
         return mdl, instance
+
+    @staticmethod
+    def _unusable(mdl, instance):
+        """Return why ``instance`` cannot be in the vector, or None if it can."""
+        if not isinstance(instance, NumParam):
+            return "is not a numerical parameter (NumParam)"
+        if isinstance(instance, ExtParam):
+            return (f"is an ExtParam, a copy of {instance.model}.{instance.src}; "
+                    "select the source instead")
+        if instance is mdl.u or instance is getattr(mdl, 'ue', None):
+            return "is the device status; use System.set_status() instead"
+        if not isinstance(instance.v, np.ndarray) or instance.v.dtype.kind != 'f' \
+                or instance.v.ndim != 1:
+            return "does not hold one float per device"
+        return None
+
+    @classmethod
+    def all(cls, system, models=None, pflow=True, base=None):
+        """
+        Build a vector of every numerical parameter of every device.
+
+        Entries are ordered by model (in ``System.models`` order), then
+        parameter (in definition order), then device. Device status (``u``),
+        ``ExtParam`` copies and non-float parameters are left out, as they
+        cannot be set through the vector.
+
+        Parameters
+        ----------
+        system : System
+            A system on which ``setup()`` has been called.
+        models : list of str, optional
+            Only include these models. Default: all models with devices.
+        pflow : bool, optional
+            ``False`` leaves out power flow models (``Bus``, ``Line``,
+            ``PQ``, ...), leaving the parameters that
+            ``TDS.reinit(keep_params=True)`` can apply. Default ``True``.
+        base : None or 'device', optional
+            As in :class:`ParamVector`.
+
+        Returns
+        -------
+        ParamVector
+
+        Examples
+        --------
+        >>> pv = ParamVector.all(ss, pflow=False)
+        >>> pv.as_df().query("model == 'TGOV1'")
+        """
+        if not system.is_setup:
+            raise RuntimeError("ParamVector requires a system after setup().")
+        if models is not None:
+            unknown = [m for m in models if m not in system.models]
+            if unknown:
+                raise KeyError(f"Not models: {', '.join(unknown)}.")
+
+        select = []
+        for mname, mdl in system.models.items():
+            if mdl.n == 0 or (models is not None and mname not in models):
+                continue
+            if not pflow and mname in system.exist.pflow:
+                continue
+            for pname, instance in mdl.num_params.items():
+                if cls._unusable(mdl, instance) is None:
+                    select.append((mname, pname))
+
+        return cls(system, select, base=base)
+
+    def subset(self, mask):
+        """
+        Return a new ``ParamVector`` with the selected entries.
+
+        Entries keep their order within each ``(model, param)``; parameters
+        appear in the order of their first selected entry.
+
+        Parameters
+        ----------
+        mask : array-like of bool or int
+            A boolean mask of length :attr:`size`, or entry positions.
+
+        Returns
+        -------
+        ParamVector
+
+        Examples
+        --------
+        >>> pv = ParamVector.all(ss)
+        >>> dyn = pv.subset(~pv.pflow)
+        >>> gains = pv.subset([pv.index('TGOV1', 'R', 1), pv.index('EXDC2', 'KA', 1)])
+        """
+        mask = np.asarray(mask)
+        if mask.dtype == bool:
+            if mask.shape != (self.size,):
+                raise ValueError(f"Boolean mask must have length {self.size}.")
+            positions = np.flatnonzero(mask)
+        else:
+            positions = mask.astype(int).ravel()
+            if positions.size and (positions.min() < -self.size or positions.max() >= self.size):
+                raise IndexError("Entry position out of range.")
+            positions = positions % self.size if self.size else positions
+
+        grouped = OrderedDict()
+        for i in positions.tolist():
+            grouped.setdefault((self.model[i], self.param[i]), []).append(self.idx[i])
+
+        select = [(m, p, idx) for (m, p), idx in grouped.items()]
+        return ParamVector(self.system, select, base=self.base)
 
     def __len__(self):
         return self.size
