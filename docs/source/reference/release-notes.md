@@ -23,6 +23,11 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
   entry names, positions and metadata, for optimizers and sensitivity studies.
   `ParamVector.all(ss)` collects every numerical parameter of the system
   (`pflow=False` for dynamic models only), and `subset()` narrows it down.
+- Add `andes.core.ParamJacobian`, which evaluates the sparse parameter
+  Jacobians `df/dp`, `dg/dp` and `dTf/dp` for a `ParamVector`, for
+  trajectory sensitivity analysis. Derivatives follow the chain through the
+  `ConstService` and `VarService` expressions of each model, with complex
+  services split into real and imaginary parts.
 - Fix `Toggle` re-initialization overwriting the stored initial status with
   1, which switched on devices that start offline.
 

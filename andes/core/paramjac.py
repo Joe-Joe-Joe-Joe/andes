@@ -1,0 +1,466 @@
+"""
+Jacobians of the DAE equations with respect to parameters.
+"""
+
+#  [ANDES] (C)2015-2024 Hantao Cui
+#
+#  This program is free software; you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation; either version 3 of the License, or
+#  (at your option) any later version.
+
+import inspect
+import logging
+from collections import OrderedDict
+
+import sympy as sp
+from sympy.core.function import AppliedUndef
+
+from andes.core.service import PostInitService, VarService
+from andes.core.symprocessor import SymProcessor, select_args_add
+from andes.shared import np
+
+logger = logging.getLogger(__name__)
+
+
+def _expand_helpers(expr):
+    """
+    Rewrite functions that ANDES evaluates with NumPy but SymPy does not
+    know, so that they can be differentiated:
+
+    - ``conj(z)`` becomes ``conjugate(z)``;
+    - ``radians(x)`` becomes ``x * pi / 180``;
+    - ``safe_div(a, b)`` becomes ``Piecewise((a / b, b != 0), (0, True))``.
+
+    ``Indicator`` (a 0/1 flag) is kept and held constant by :func:`_diff`.
+    """
+    rules = {
+        sp.Function('conj'): lambda z: sp.conjugate(z),
+        sp.Function('radians'): lambda x: x * sp.pi / 180,
+        sp.Function('safe_div'): lambda a, b: sp.Piecewise((a / b, sp.Ne(b, 0)), (0, True)),
+    }
+    for func, rewrite in rules.items():
+        if expr.has(func):
+            expr = expr.replace(func, rewrite)
+    return expr
+
+
+def _diff(expr, sym):
+    """
+    Differentiate ``expr`` with respect to ``sym``.
+
+    Calls of undefined functions (such as ``Indicator(x > 0)``, a 0/1 flag)
+    are piecewise constant in ANDES models and are held fixed.
+    """
+    calls = {c: sp.Dummy() for c in expr.atoms(AppliedUndef)}
+    if not calls:
+        return sp.diff(expr, sym)
+    d = sp.diff(expr.xreplace(calls), sym)
+    return d.xreplace({v: k for k, v in calls.items()})
+
+
+def _substitute(expr, rule):
+    """
+    ``expr.xreplace(rule)``, skipping substitutions that SymPy rejects, such
+    as non-real expressions inside comparisons. Skipped symbols stay in the
+    expression and are differentiated through as constants.
+    """
+    try:
+        return expr.xreplace(rule)
+    except TypeError:
+        pass
+    for sym, value in rule.items():
+        try:
+            expr = expr.xreplace({sym: value})
+        except TypeError:
+            continue
+    return expr
+
+
+class _Term:
+    """A lambdified expression and the names of its inputs."""
+
+    def __init__(self, expr, inputs_dict, modules):
+        self.expr = expr
+        known = set(inputs_dict.values())
+        syms = sorted((s for s in expr.free_symbols if s in known), key=lambda s: s.name)
+        unknown = [s for s in expr.free_symbols if s not in known]
+        if unknown:
+            raise ValueError(f'Expression "{expr}" contains unknown symbols {unknown}.')
+
+        self.args = [s.name for s in syms]
+        self.func = sp.lambdify(syms, expr, modules=modules)
+        if 'select' in inspect.getsource(self.func):
+            # the printer for Piecewise refers to these helper arrays by name
+            extra = [sp.Symbol(name) for name in select_args_add]
+            self.func = sp.lambdify(syms + extra, expr, modules=modules)
+            self.args = self.args + select_args_add
+
+    def __call__(self, inputs, n):
+        out = self.func(*[inputs[name] for name in self.args])
+        out = np.broadcast_to(np.asarray(out), (n,))
+        if np.iscomplexobj(out):
+            out = out.real
+        return out.astype(float)
+
+
+class _ModelParamJac:
+    """
+    Symbolic parameter derivatives for one model.
+
+    Services form a chain: ``ds/dp = d(expr_s)/dp + sum(d(expr_s)/ds' ds'/dp)``
+    over earlier services ``s'``. A complex service ``c`` enters the chain as
+    two real nodes ``c__re`` and ``c__im``, so that every expression is real
+    and SymPy can differentiate ``re``, ``im``, ``conj``, ``abs`` and ``arg``
+    of it.
+    """
+
+    def __init__(self, mdl, params):
+        self.mdl = mdl
+        self.params = list(params)
+        self.unsupported = []
+
+        syms = SymProcessor(mdl)
+        syms.generate_symbols()
+        syms.generate_subs_expr()
+        known = OrderedDict(syms.inputs_dict)
+        modules = syms.lambdify_func
+
+        # complex services -> real and imaginary symbols
+        self.split = OrderedDict()     # complex service name -> (re name, im name)
+        to_real = {}
+        for name, instance in mdl.services.items():
+            if instance.vtype == complex:
+                re_s = sp.Symbol(f'{name}__re', real=True)
+                im_s = sp.Symbol(f'{name}__im', real=True)
+                known[re_s.name], known[im_s.name] = re_s, im_s
+                to_real[known[name]] = re_s + sp.I * im_s
+                self.split[name] = (re_s.name, im_s.name)
+
+        def parse(string):
+            expr = sp.sympify(string, locals=syms.inputs_dict)
+            expr = _expand_helpers(syms._do_substitute(expr))
+            return _substitute(expr, to_real)
+
+        psyms = {p: known[p] for p in self.params}
+
+        # chain nodes in evaluation order: name -> (expression, is VarService)
+        nodes = OrderedDict()
+        for name, instance in mdl.services.items():
+            if isinstance(instance, PostInitService) or instance.v_str is None \
+                    or instance.v_numeric is not None:
+                continue          # set from variables after init, or numerically
+            expr = parse(instance.v_str)
+            is_var = isinstance(instance, VarService)
+            if name in self.split:
+                re_e, im_e = (sp.expand_complex(sp.re(expr)), sp.expand_complex(sp.im(expr)))
+                re_n, im_n = self.split[name]
+                nodes[re_n] = (re_e, is_var)
+                nodes[im_n] = (im_e, is_var)
+            else:
+                nodes[name] = (expr, is_var)
+
+        # equations: rows are the variables whose `e_str` defines them
+        eq_exprs = [(var, parse(var.e_str))
+                    for var in list(mdl.cache.states_and_ext.values())
+                    + list(mdl.cache.algebs_and_ext.values())
+                    if var.e_str is not None]
+        tconsts = [(var, var.t_const.name) for var in mdl.states.values()
+                   if var.t_const is not None]
+
+        # nodes used by the equations, directly or through other nodes ...
+        needed = {known[name] for _, name in tconsts if name in known}
+        for _, expr in eq_exprs:
+            needed |= expr.free_symbols
+        for name in reversed(nodes):
+            if known[name] in needed:
+                needed |= nodes[name][0].free_symbols
+
+        # ... and that depend on the parameters
+        self.varying = OrderedDict()   # node name -> is VarService
+        reach = set(psyms.values())
+        for name, (expr, is_var) in nodes.items():
+            if known[name] in needed and expr.free_symbols & reach:
+                self.varying[name] = is_var
+                reach.add(known[name])
+
+        def term(expr, sym, where):
+            if isinstance(expr, (sp.logic.boolalg.BooleanFunction, sp.logic.boolalg.BooleanAtom,
+                                 sp.core.relational.Relational)):
+                return None       # a true/false flag: piecewise constant
+            d = _diff(expr, sym)
+            if d == 0:
+                return None
+            if d.has(sp.Derivative) or d.has(sp.Subs):
+                self.unsupported.append(f'{mdl.class_name}.{where} w.r.t. {sym}')
+                return None
+            return _Term(d, known, modules)
+
+        def derivative_terms(expr, where):
+            """Terms of d(expr)/dp, split into parameter and node parts."""
+            d_p, d_s = OrderedDict(), OrderedDict()
+            fs = expr.free_symbols
+            for p, ps in psyms.items():
+                if ps in fs:
+                    t = term(expr, ps, where)
+                    if t is not None:
+                        d_p[p] = t
+            for name in self.varying:
+                if known[name] in fs:
+                    t = term(expr, known[name], where)
+                    if t is not None:
+                        d_s[name] = t
+            return d_p, d_s
+
+        self.d_services = OrderedDict(
+            (name, derivative_terms(nodes[name][0], name)) for name in self.varying)
+
+        self.eqs = []       # (variable instance, d_p, d_s)
+        for var, expr in eq_exprs:
+            d_p, d_s = derivative_terms(expr, var.name)
+            if d_p or d_s:
+                self.eqs.append((var, d_p, d_s))
+
+        # time constants of differential equations
+        self.tconst = [(var, name) for var, name in tconsts
+                       if name in self.params or name in self.varying]
+
+        self.frozen = {}
+
+    def _inputs(self):
+        """Model inputs plus the real and imaginary parts of complex services."""
+        inputs = dict(self.mdl.get_inputs(refresh=True))
+        for name, (re_n, im_n) in self.split.items():
+            v = np.asarray(self.mdl.services[name].v)
+            inputs[re_n], inputs[im_n] = np.real(v), np.imag(v)
+        return inputs
+
+    def _service_derivatives(self, inputs, n, frozen):
+        """
+        Total derivatives ``ds/dp`` of the varying nodes, as
+        ``{node: {param: array}}``. ``frozen`` holds the values for
+        ConstServices computed at ``t=0``; VarServices are evaluated now.
+        """
+        out = OrderedDict()
+        for name, is_var in self.varying.items():
+            if not is_var and name in frozen:
+                out[name] = frozen[name]
+                continue
+            d_p, d_s = self.d_services[name]
+            total = {}
+            for p, term in d_p.items():
+                total[p] = term(inputs, n).copy()
+            for s, term in d_s.items():
+                ds = term(inputs, n)
+                for p, v in out.get(s, {}).items():
+                    total[p] = total.get(p, 0.0) + ds * v
+            out[name] = total
+        return out
+
+    def freeze(self):
+        """Evaluate and store ``ds/dp`` of ConstServices at the current state."""
+        derivs = self._service_derivatives(self._inputs(), self.mdl.n, {})
+        self.frozen = {name: v for name, v in derivs.items() if not self.varying[name]}
+
+    def triplets(self, cols):
+        """
+        Return ``(f, g, tf)`` lists of ``(rows, cols, vals)`` triplets.
+
+        ``cols[p]`` maps device uid to the column in the parameter vector
+        (``-1`` for devices not in the vector).
+        """
+        n = self.mdl.n
+        inputs = self._inputs()
+        svc = self._service_derivatives(inputs, n, self.frozen)
+        out = {'f': [], 'g': [], 'tf': []}
+
+        def add(kind, rows, totals):
+            for p, vals in totals.items():
+                c = cols[p]
+                vals = np.broadcast_to(vals, (n,))
+                keep = (c >= 0) & (vals != 0)
+                if np.any(keep):
+                    out[kind].append((np.asarray(rows)[keep], c[keep], vals[keep]))
+
+        for var, d_p, d_s in self.eqs:
+            totals = {p: term(inputs, n) for p, term in d_p.items()}
+            for s, term in d_s.items():
+                ds = term(inputs, n)
+                for p, v in svc[s].items():
+                    totals[p] = totals.get(p, 0.0) + ds * v
+            add(var.e_code, var.a, totals)
+
+        for var, name in self.tconst:
+            if name in self.params:
+                add('tf', var.a, {name: np.ones(n)})
+            else:
+                add('tf', var.a, svc[name])
+
+        return out
+
+
+class ParamJacobian:
+    """
+    Jacobians of the DAE residuals with respect to a :class:`ParamVector`.
+
+    With the DAE written as ``Tf(p) * dx/dt = f(x, y, p)`` and
+    ``0 = g(x, y, p)``, this class evaluates the sparse matrices ``df/dp``,
+    ``dg/dp`` and ``dTf/dp`` at the current state, for use in trajectory
+    sensitivity analysis.
+
+    Parameters enter the equations directly and through services. The
+    derivatives follow the chain through ``ConstService`` and
+    ``VarService`` expressions of the same model. Values that ANDES derives
+    from the initial state (``ExtService``, ``PostInitService``) and
+    services computed numerically are treated as constants here: their
+    dependence on parameters is part of the initial-condition sensitivity.
+    ``ConstService`` derivatives are evaluated once, at construction or by
+    :meth:`freeze`, because the services themselves are evaluated at
+    ``t=0``.
+
+    Parameters
+    ----------
+    system : System
+        A system on which ``TDS.init()`` has been called.
+    pv : ParamVector
+        The parameters; columns of the Jacobians follow its order.
+
+    Notes
+    -----
+    The Jacobians describe ``e_str`` equations at fixed ``(x, y)``. Rows of
+    states pegged by anti-windup limiters are zeroed, as ANDES overwrites
+    those residuals. A pegged state is held at its limit, so a change of a
+    limit parameter moves the state itself; that enters a sensitivity
+    analysis through the state, not through these Jacobians. Discrete
+    flags (limiters, deadbands, lookup-table segments) are held at their
+    current values, so at a point exactly on a limit or breakpoint the
+    result is the one-sided derivative of the active segment.
+    Parts that cannot be differentiated are listed in :attr:`unsupported`
+    and taken as zero: numerical equations (``f_numeric``, ``g_numeric``)
+    and expressions SymPy leaves unevaluated. Derivatives that are not
+    finite at the current point, for example of a saturation coefficient
+    at zero, are set to zero; :attr:`nonfinite` lists the affected entries
+    of the last evaluation.
+
+    Examples
+    --------
+    >>> pv = ParamVector.all(ss, pflow=False)
+    >>> pj = ParamJacobian(ss, pv)
+    >>> fp, gp = pj.evaluate()       # scipy.sparse, (dae.n, len(pv)), (dae.m, len(pv))
+    """
+
+    def __init__(self, system, pv):
+        if not system.TDS.initialized:
+            raise RuntimeError("ParamJacobian requires TDS.init().")
+        if pv.system is not system:
+            raise ValueError("The ParamVector belongs to another system.")
+
+        self.system = system
+        self.pv = pv
+        self.unsupported = []
+        self.nonfinite = []
+
+        self._models = OrderedDict()   # model name -> (_ModelParamJac, cols)
+        for (mname, pname), (mdl, _, uid, sl) in pv._blocks.items():
+            if mname not in self._models:
+                self._models[mname] = (mdl, OrderedDict())
+            col = np.full(mdl.n, -1, dtype=int)
+            col[uid] = np.arange(sl.start, sl.stop)
+            self._models[mname][1][pname] = col
+
+        for mname, (mdl, cols) in list(self._models.items()):
+            for flag in ('f_num', 'g_num'):
+                if getattr(mdl.flags, flag, False):
+                    self.unsupported.append(f'{mname}.{flag[0]}_numeric')
+                    break
+            mpj = _ModelParamJac(mdl, cols.keys())
+            self.unsupported.extend(mpj.unsupported)
+            self._models[mname] = (mpj, cols)
+
+        if self.unsupported:
+            logger.warning("ParamJacobian: not differentiated (taken as zero): %s",
+                           '; '.join(self.unsupported))
+
+        self.freeze()
+
+    def freeze(self):
+        """
+        Evaluate the ``ConstService`` derivatives at the current state.
+
+        Called at construction. Call again at ``t=0`` after
+        ``TDS.reinit(keep_params=True)`` with new parameter values.
+        """
+        if self.system.dae.t != 0:
+            raise RuntimeError("ParamJacobian.freeze() must be called at t=0.")
+        for mpj, _ in self._models.values():
+            mpj.freeze()
+
+    def evaluate(self):
+        """
+        Evaluate ``df/dp`` and ``dg/dp`` at the current state.
+
+        Returns
+        -------
+        fp, gp : scipy.sparse.csr_matrix
+            Of shape ``(dae.n, len(pv))`` and ``(dae.m, len(pv))``.
+        """
+        trip = self._collect()
+        fp = self._assemble(trip['f'], self.system.dae.n)
+        fp = self._zero_pegged(fp)
+        gp = self._assemble(trip['g'], self.system.dae.m)
+        self._check_finite(fp, gp)
+        return fp, gp
+
+    def _check_finite(self, *mats):
+        """Set non-finite entries to zero and record their columns in `nonfinite`."""
+        bad = set()
+        for m in mats:
+            mask = ~np.isfinite(m.data)
+            if np.any(mask):
+                bad.update(m.tocoo().col[~np.isfinite(m.tocoo().data)].tolist())
+                m.data[mask] = 0.0
+                m.eliminate_zeros()
+        self.nonfinite = [self.pv.names[j] for j in sorted(bad)]
+        if self.nonfinite:
+            logger.warning("ParamJacobian: derivatives not finite at the current point, "
+                           "set to zero: %s", ', '.join(self.nonfinite))
+
+    def tf_p(self):
+        """
+        Return ``dTf/dp`` as a sparse matrix of shape ``(dae.n, len(pv))``.
+
+        Non-zero for parameters (or services of parameters) used as time
+        constants, such as ``GENROU.M``.
+        """
+        tp = self._assemble(self._collect()['tf'], self.system.dae.n)
+        self._check_finite(tp)
+        return tp
+
+    def _collect(self):
+        out = {'f': [], 'g': [], 'tf': []}
+        for mpj, cols in self._models.values():
+            for kind, items in mpj.triplets(cols).items():
+                out[kind].extend(items)
+        return out
+
+    def _assemble(self, items, nrows):
+        from scipy.sparse import coo_matrix
+
+        if items:
+            rows = np.concatenate([np.asarray(r, dtype=int) for r, _, _ in items])
+            cols = np.concatenate([c for _, c, _ in items])
+            vals = np.concatenate([v for _, _, v in items])
+        else:
+            rows = cols = np.array([], dtype=int)
+            vals = np.array([], dtype=float)
+        return coo_matrix((vals, (rows, cols)), shape=(nrows, len(self.pv))).tocsr()
+
+    def _zero_pegged(self, fp):
+        pegged = [int(k) for item in self.system.antiwindups for key, _, _ in item.x_set
+                  for k in np.atleast_1d(key)]
+        if pegged:
+            fp = fp.tolil()
+            fp[pegged, :] = 0
+            fp = fp.tocsr()
+            fp.eliminate_zeros()
+        return fp
