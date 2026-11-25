@@ -147,8 +147,11 @@ class TrajectorySensitivity:
 
     The initial sensitivities ``S(0)``, and the derivatives of the values
     that ANDES fixes at initialization (setpoints such as ``vref0`` and
-    ``pref0``, ``ExtService`` and ``PostInitService`` values), are computed
-    by central differences of ``TDS.reinit(keep_params=True)``.
+    ``pref0``, ``ExtService`` and ``PostInitService`` values), come from
+    differentiating the initialization itself
+    (:class:`andes.routines.initsens.InitSensitivity`), or, with
+    ``init='fd'``, from central differences of
+    ``TDS.reinit(keep_params=True)``.
 
     Parameters
     ----------
@@ -158,8 +161,14 @@ class TrajectorySensitivity:
     pv : ParamVector
         Parameters of dynamic models, including event times
         (``TimerParam`` such as ``Fault.tf``, ``Fault.tc`` or ``Toggle.t``).
+    init : 'exact' or 'fd', optional
+        How to compute the initial sensitivities. ``'exact'`` (default)
+        differentiates the initialization sequence, and falls back to
+        ``'fd'`` with a warning for models it does not support (``COI``);
+        ``'fd'`` uses central differences, two re-initializations per
+        parameter.
     rel_step : float, optional
-        Relative step for the finite differences of the initialization.
+        Relative step for ``init='fd'``.
 
     Notes
     -----
@@ -204,7 +213,7 @@ class TrajectorySensitivity:
     >>> s = sens.get(ss.GENROU.omega)      # (len(t), n_gen, len(pv))
     """
 
-    def __init__(self, system, pv, rel_step=1e-6):
+    def __init__(self, system, pv, init='exact', rel_step=1e-6):
         tds = system.TDS
         if not tds.initialized:
             raise RuntimeError("Call TDS.init() before TrajectorySensitivity.")
@@ -228,13 +237,31 @@ class TrajectorySensitivity:
             if isinstance(inst, TimerParam):
                 self._timer[sl] = True
 
-        self.S0, self.const_totals = self._initial_sensitivity()
+        if init == 'exact':
+            from andes.routines.initsens import InitSensitivity
+
+            try:
+                ex = InitSensitivity(system, pv)
+            except NotImplementedError as e:
+                logger.warning("Exact initial sensitivity not available (%s); "
+                               "using finite differences.", e)
+                init = 'fd'
+        if init == 'exact':
+            self.S0, self.const_totals = ex.S0, ex.const_totals
+            self.init_unsupported, self.init_nonfinite = ex.unsupported, ex.nonfinite
+        elif init == 'fd':
+            self.S0, self.const_totals = self._initial_sensitivity()
+            self.init_unsupported, self.init_nonfinite = [], []
+        else:
+            raise ValueError(f"init must be 'exact' or 'fd', got {init!r}")
         self.pj = ParamJacobian(system, pv, const_totals=self.const_totals)
         self.vsj = varservice_jacobian(system)
         self.unsupported = list(self.pj.unsupported) + list(self.vsj.unsupported)
         self.tp = self.pj.tf_p().tocsr()
         self._pinned = self._pinned_limits()
         self._pin_index = self._pinned_index()
+        if init == 'exact':
+            self.inconsistent = self._check_equilibrium()
 
         self.t = np.array([])
         self.Sx = np.zeros((0, system.dae.n, len(pv)))
@@ -311,6 +338,36 @@ class TrajectorySensitivity:
         totals = {m: {s: a for s, a in d.items() if np.any(a)} for m, d in totals.items()}
         totals = {m: d for m, d in totals.items() if d}
         return S0, totals
+
+    def _check_equilibrium(self, tol=1e-4):
+        """
+        Entries of ``pv`` for which ``d(f, g)/dp`` at ``t=0`` is not zero,
+        that is, whose change breaks the initial equilibrium.
+        """
+        from scipy.sparse import coo_matrix
+
+        ss = self.system
+        n, m = ss.dae.n, ss.dae.m
+        jac, fp, gp = self._jacobians()
+        mat = {}
+        for k, shape in (('fx', (n, n)), ('fy', (n, m)), ('gx', (m, n)), ('gy', (m, m))):
+            r, c, v = jac[k]
+            mat[k] = coo_matrix((v, (r, c)), shape=shape).tocsr()
+        Sx, Sy = self.S0[:n], self.S0[n:]
+        R = np.vstack([mat['fx'] @ Sx + mat['fy'] @ Sy + fp.toarray(),
+                       mat['gx'] @ Sx + mat['gy'] @ Sy + gp.toarray()])
+        skip = list(np.asarray(ss.no_check_init, dtype=int))
+        skip += [int(k) for item in ss.antiwindups for key, _, _ in item.x_set
+                 for k in np.atleast_1d(key)]
+        R[skip] = 0.0
+        R[:, self._timer] = 0.0
+        bad = [self.pv.names[j] for j in np.flatnonzero(np.abs(R).max(axis=0) > tol)]
+        if bad:
+            logger.warning("TrajectorySensitivity: after changing these parameters, the "
+                           "initialization no longer matches the power flow, so t=0 is not an "
+                           "equilibrium and their sensitivities are not meaningful: %s",
+                           ', '.join(bad))
+        return bad
 
     def _init_residual(self):
         """Residuals at the current (initial) point, as checked by ``TDS.test_init``."""

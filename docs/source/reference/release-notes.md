@@ -35,6 +35,13 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
   terms through `VarService` values that the Newton Jacobians leave out.
   Initial sensitivities and the derivatives of initialization setpoints are
   computed by central differences of `TDS.reinit(keep_params=True)`.
+- Add `andes.routines.initsens.InitSensitivity`, which differentiates the
+  TDS initialization in forward mode (services, `v_str` assignments,
+  `v_iter` groups, external values and post-init services) to give exact
+  initial sensitivities. `TrajectorySensitivity` uses it by default
+  (`init='exact'`), about 15 times faster than the previous central
+  differences (`init='fd'`), which remain the fallback for models with
+  per-generator arrays such as `COI`.
 - `TrajectorySensitivity` supports event times (`Fault.tf`, `Fault.tc`,
   `Toggle.t`, `Alter.t`): steps tied to an event time move with it, and the
   step size enters the trapezoid step. `get(var, fixed_time=True)` converts
