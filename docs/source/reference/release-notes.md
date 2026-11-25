@@ -35,6 +35,10 @@ The APIs before v3.0.0 are in beta and may change without prior notice.
   terms through `VarService` values that the Newton Jacobians leave out.
   Initial sensitivities and the derivatives of initialization setpoints are
   computed by central differences of `TDS.reinit(keep_params=True)`.
+- `TrajectorySensitivity` supports event times (`Fault.tf`, `Fault.tc`,
+  `Toggle.t`, `Alter.t`): steps tied to an event time move with it, and the
+  step size enters the trapezoid step. `get(var, fixed_time=True)` converts
+  to derivatives at fixed times.
 - Add `andes.core.paramjac.varservice_jacobian` for the Jacobian terms that
   pass through `VarService` values.
 - Fix `Toggle` re-initialization overwriting the stored initial status with

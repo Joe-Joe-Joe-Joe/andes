@@ -120,6 +120,89 @@ class TestSensitivityFault(SensitivityCase):
               ('TGOV1', 'R', 'TGOV1_1'), ('Fault', 'xf', 1)]
 
 
+def _fd_steps(ss, pv, j, delta=1e-6):
+    """
+    Central difference by step index, with an absolute step small enough
+    that the step grid keeps its order around event times.
+    """
+    p0 = pv.get()
+    out = []
+    for sign in (1, -1):
+        p = p0.copy()
+        p[j] += sign * delta
+        ss.TDS.reinit()
+        pv.set(p)
+        ss.TDS.reinit(keep_params=True)
+        out.append(_trajectory(ss))
+    ss.TDS.reinit()
+    pv.set(p0)
+    ss.TDS.reinit(keep_params=True)
+    (tp, xp), (tm, xm) = out
+    assert tp.shape == tm.shape
+    return (tp - tm) / (2 * delta), (xp - xm) / (2 * delta), tp, xp, tm, xm
+
+
+class TestSensitivityEventTimes(unittest.TestCase):
+    """Fault on and clearing times; derivatives of values at each step."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ss = _load('ieee14/ieee14_fault.xlsx', tol=1e-7, honest=1)
+        cls.pv = ParamVector(cls.ss, ['Fault.tf', 'Fault.tc', ('GENROU', 'M', 'GENROU_2')])
+        cls.sens = TrajectorySensitivity(cls.ss, cls.pv)
+        cls.sens.run(no_summary=True)
+
+    def test_step_values(self):
+        ss, pv, sens = self.ss, self.pv, self.sens
+        S = np.concatenate([sens.Sx, sens.Sy], axis=1)[1:]    # dae.ts has no t=0
+        for j in range(len(pv)):
+            dt, fd, *_ = _fd_steps(ss, pv, j)
+            with self.subTest(pv.names[j]):
+                np.testing.assert_allclose(sens.dt[1:, j], dt, atol=1e-8)
+                scale = np.abs(fd).max()
+                self.assertGreater(scale, 0)
+                np.testing.assert_allclose(S[:, :, j], fd, rtol=0, atol=2e-2 * scale)
+
+    def test_grid_derivative(self):
+        """Steps from ``tf - eps`` up to ``tc - eps`` move with ``tf``, later ones with ``tc``."""
+        t, dt = self.sens.t, self.sens.dt
+        j_tf, j_tc = self.pv.index('Fault', 'tf', 1), self.pv.index('Fault', 'tc', 1)
+        np.testing.assert_array_equal(dt[t < 1.0 - 2e-4, j_tf], 0)
+        np.testing.assert_array_equal(dt[(t >= 1.0 - 1e-4) & (t < 1.1 - 2e-4), j_tf], 1)
+        np.testing.assert_array_equal(dt[t >= 1.1 - 1e-4, j_tf], 0)
+        np.testing.assert_array_equal(dt[(t >= 1.1 - 1e-4) & (t < 3.0), j_tc], 1)
+        self.assertEqual(dt[-1, j_tc], 0)                     # the last step ends at tf
+        np.testing.assert_array_equal(dt[:, self.pv.index('GENROU', 'M', 'GENROU_2')], 0)
+
+    def test_fixed_time_same_for_other_parameters(self):
+        j = self.pv.index('GENROU', 'M', 'GENROU_2')
+        var = self.ss.GENROU.delta
+        np.testing.assert_array_equal(self.sens.get(var, fixed_time=True)[:, :, j],
+                                      self.sens.get(var)[:, :, j])
+
+
+class TestSensitivityFixedTime(unittest.TestCase):
+    """Derivative of a trajectory at fixed times with respect to a line trip time."""
+
+    def test_toggle_time(self):
+        from scipy.interpolate import CubicSpline
+
+        ss = _load('kundur/kundur_full.xlsx')
+        pv = ParamVector(ss, ['Toggle.t'])
+        sens = TrajectorySensitivity(ss, pv)
+        sens.run(no_summary=True)
+        omega = ss.GENROU.omega
+        fixed = sens.get(omega, fixed_time=True)[:, :, 0]
+
+        _, _, tp, xp, tm, xm = _fd_steps(ss, pv, 0, delta=5e-5)
+        a = np.asarray(omega.a)
+        keep = (sens.t > 2.03) & (sens.t < 2.9)        # away from the trip and the end
+        vals = [CubicSpline(tt[tt > 2.01], xx[tt > 2.01][:, a], axis=0)(sens.t[keep])
+                for tt, xx in ((tp, xp), (tm, xm))]
+        fd = (vals[0] - vals[1]) / 1e-4
+        np.testing.assert_allclose(fixed[keep], fd, rtol=0, atol=2e-3 * np.abs(fd).max())
+
+
 class TestSensitivityInconsistent(unittest.TestCase):
 
     def test_flags_setpoint_parameters(self):
@@ -140,8 +223,6 @@ class TestSensitivityErrors(unittest.TestCase):
         ss = self.ss
         with self.assertRaises(ValueError):
             TrajectorySensitivity(ss, ParamVector(ss, ['Line.x']))
-        with self.assertRaises(ValueError):
-            TrajectorySensitivity(ss, ParamVector(ss, ['Fault.tc']))
 
         ss.TDS.run(no_summary=True)
         with self.assertRaises(RuntimeError):

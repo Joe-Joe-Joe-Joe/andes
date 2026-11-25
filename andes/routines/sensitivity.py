@@ -131,6 +131,16 @@ class TrajectorySensitivity:
     trajectory for a given sequence of step sizes. States pinned by
     anti-windup limiters take the derivative of their limit.
 
+    Event times move the step grid. ANDES lands steps exactly on
+    ``t* - eps``, ``t*`` and ``t* + eps`` of every event time ``t*``, and
+    the event acts at the same step whatever ``t*`` is. So step ``k`` ends
+    at ``t_k(p)``, with ``dt_k/dp`` equal to 1 for steps tied to an event
+    time ``p`` and those after it, and the step size enters as
+    ``+ dh/dp * (f1 + f0) / 2`` on the right-hand side. :attr:`Sx` and
+    :attr:`Sy` are derivatives of the values at each step, whose time moves
+    with an event time; :meth:`get` with ``fixed_time=True`` converts them
+    to derivatives at fixed times.
+
     The Jacobians are evaluated exactly at each converged point. This
     includes the terms through ``VarService`` values (such as ``ESST3A.VE``),
     which the Jacobians that ANDES uses for Newton's method leave out.
@@ -146,16 +156,17 @@ class TrajectorySensitivity:
         A system after ``TDS.init()`` (or a plain ``TDS.reinit()``), at
         ``t = 0``.
     pv : ParamVector
-        Parameters of dynamic models, without event times.
+        Parameters of dynamic models, including event times
+        (``TimerParam`` such as ``Fault.tf``, ``Fault.tc`` or ``Toggle.t``).
     rel_step : float, optional
         Relative step for the finite differences of the initialization.
 
     Notes
     -----
     The sensitivities of all variables are stored at every step, which
-    takes ``8 * n_steps * (dae.n + dae.m) * len(pv)`` bytes. Event times
-    (``Fault.tc``, ``Toggle.t``) and parameters of power flow models are
-    not supported. Switching of limiters between steps is not located in
+    takes ``8 * n_steps * (dae.n + dae.m) * len(pv)`` bytes. Parameters
+    of power flow models are not supported. Switching of limiters between
+    steps is not located in
     time, as in the simulation itself. At a parameter value where the model
     changes structure, such as a zero resistance or time constant, the
     derivative is one-sided.
@@ -174,6 +185,13 @@ class TrajectorySensitivity:
     Sx, Sy : np.ndarray
         Sensitivities of states and algebraic variables, shapes
         ``(len(t), dae.n, len(pv))`` and ``(len(t), dae.m, len(pv))``.
+    dt : np.ndarray
+        Derivatives of the step times, shape ``(len(t), len(pv))``. Non-zero
+        only for event times.
+    xdot, ydot : np.ndarray
+        Time derivatives of the variables at each step, for converting to
+        fixed-time sensitivities (``ydot`` is computed only when ``pv``
+        contains event times).
 
     Examples
     --------
@@ -200,15 +218,15 @@ class TrajectorySensitivity:
             names = [n for n, f in zip(pv.names, pv.pflow) if f]
             raise ValueError("Parameters of power flow models need a new power flow and are "
                              f"not supported: {', '.join(names[:5])}...")
-        timers = [n for (m, p), (_, inst, _, _) in pv._blocks.items()
-                  for n in [f'{m}.{p}'] if isinstance(inst, TimerParam)]
-        if timers:
-            raise ValueError("Event times change the step sequence and are not supported: "
-                             + ', '.join(timers))
-
         self.system = system
         self.pv = pv
         self.rel_step = rel_step
+
+        # columns of event times (TimerParam), which move the step grid
+        self._timer = np.zeros(len(pv), dtype=bool)
+        for (_, _), (_, inst, _, sl) in pv._blocks.items():
+            if isinstance(inst, TimerParam):
+                self._timer[sl] = True
 
         self.S0, self.const_totals = self._initial_sensitivity()
         self.pj = ParamJacobian(system, pv, const_totals=self.const_totals)
@@ -261,6 +279,8 @@ class TrajectorySensitivity:
 
         try:
             for j in range(n_p):
+                if self._timer[j]:
+                    continue        # event times do not change the initialization
                 h = self.rel_step * max(1.0, abs(p0[j]))
                 runs = []
                 for sign in (1.0, -1.0):
@@ -370,6 +390,9 @@ class TrajectorySensitivity:
         self._Sy = self.S0[n:].copy()
         jac, self._fp0, _ = self._jacobians()
         self._fx0, self._fy0 = self._rhs_operators(jac)
+        self._time_map = self._switch_time_map()
+        self._dt_prev = np.zeros(len(self.pv))
+        self._dt, self._xdot, self._ydot = [self._dt_prev.copy()], [], []
         self._matrix = _StepMatrix(dae.n, dae.m, len(self.pv))
         tp = self.tp.tocoo()
         self._tp = (tp.row, tp.col, tp.data)
@@ -391,6 +414,41 @@ class TrajectorySensitivity:
         if not addr:
             return None
         return np.concatenate(addr), flags, np.vstack(rows)
+
+    def _algebraic_rate(self, jac, xdot):
+        """``dy/dt`` from ``g(x, y) = 0``: ``gy dy/dt = -gx dx/dt``."""
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.linalg import splu
+
+        n, m = self.system.dae.n, self.system.dae.m
+        (gxr, gxc, gxv), (gyr, gyc, gyv) = jac['gx'], jac['gy']
+        gx = coo_matrix((gxv, (gxr, gxc)), shape=(m, n)).tocsr()
+        gy = coo_matrix((gyv, (gyr, gyc)), shape=(m, m)).tocsc()
+        return splu(gy).solve(-(gx @ xdot))
+
+    def _switch_time_map(self):
+        """
+        Map each time that steps are clipped to (event switch times and the
+        end time) to its derivative with respect to the parameters.
+
+        ANDES lands steps exactly on ``t* - eps``, ``t*`` and ``t* + eps`` for
+        every event time ``t*``; these move with ``t*`` and stay fixed for
+        all other parameters.
+        """
+        import inspect
+
+        ss = self.system
+        eps = inspect.signature(ss.store_switch_times).parameters['eps'].default
+        out = {float(t): np.zeros(len(self.pv)) for t in ss.switch_times}
+        out[float(ss.TDS.config.tf)] = np.zeros(len(self.pv))
+
+        p = self.pv.get()
+        for j in np.flatnonzero(self._timer):
+            v = np.float64(p[j])
+            for t in (v - eps, v, v + eps):
+                if float(t) in out:
+                    out[float(t)][j] = 1.0
+        return out
 
     def _pinned_rows(self, rhs):
         """Mark states pinned at a limit and put the limit's derivative into ``rhs``."""
@@ -428,6 +486,14 @@ class TrajectorySensitivity:
         r, c, v = self._tp
         np.add.at(rhs, (r, c), -v * (dae.x - tds.x0)[r])
 
+        # the step grid: a step clipped to a switch time (or to the end time)
+        # ends at that time; any other step keeps the previous step's shift
+        dt = self._time_map.get(float(dae.t), self._dt_prev)
+        dh = dt - self._dt_prev
+        cols = np.flatnonzero(dh)
+        if cols.size:
+            rhs[:n, cols] += 0.5 * (dae.f + tds.f0)[:, None] * dh[cols]
+
         # states pinned at a limit follow the limit: their rows become
         # identity rows with the derivative of the limit on the right
         pinned = self._pinned_rows(rhs)
@@ -440,6 +506,14 @@ class TrajectorySensitivity:
         self._t.append(float(dae.t))
         self._sx.append(self._Sx)
         self._sy.append(self._Sy)
+
+        self._dt_prev = dt.copy()
+        self._dt.append(self._dt_prev)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            xdot = np.where(Tf != 0, dae.f / Tf, 0.0)
+        self._xdot.append(xdot)
+        self._ydot.append(self._algebraic_rate(jac, xdot) if self._timer.any()
+                          else np.zeros(dae.m))
 
     def run(self, **kwargs):
         """
@@ -465,9 +539,13 @@ class TrajectorySensitivity:
         self.t = np.array(self._t)
         self.Sx = np.array(self._sx)
         self.Sy = np.array(self._sy)
+        self.dt = np.array(self._dt)
+        n, m = self.system.dae.n, self.system.dae.m
+        self.xdot = np.array([np.zeros(n)] + self._xdot)
+        self.ydot = np.array([np.zeros(m)] + self._ydot)
         return ret
 
-    def get(self, var):
+    def get(self, var, fixed_time=False):
         """
         Sensitivities of a model variable, shape ``(len(t), var.n, len(pv))``.
 
@@ -475,6 +553,20 @@ class TrajectorySensitivity:
         ----------
         var : BaseVar
             A model variable, such as ``ss.GENROU.omega``.
+        fixed_time : bool, optional
+            ``False`` (default): derivatives of the values at each step. For
+            event times, the step times move too (by :attr:`dt`).
+            ``True``: derivatives at fixed times, ``S - dX/dt * dt``, with
+            ``dX/dt`` from the equations (``Tf dx/dt = f`` and
+            ``gy dy/dt = -gx dx/dt``). Identical for parameters other than
+            event times. Not meaningful right at an event, where the
+            variable jumps.
         """
         a = np.asarray(var.a, dtype=int)
-        return self.Sx[:, a, :] if var.v_code == 'x' else self.Sy[:, a, :]
+        if var.v_code == 'x':
+            S, rate = self.Sx[:, a, :], self.xdot[:, a]
+        else:
+            S, rate = self.Sy[:, a, :], self.ydot[:, a]
+        if fixed_time:
+            S = S - rate[:, :, None] * self.dt[:, None, :]
+        return S
